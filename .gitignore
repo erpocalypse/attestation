@@ -1,0 +1,102 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.*
+jspm_packages/
+
+# Build output
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Bun
+.bun/
+bun.lockb.bak
+
+# Amplify custom-rules apply scratch file (written + deleted by apply-sitemap-rewrites.ts)
+infra/amplify/.custom-rules.tmp.json
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Caches
+.cache/
+.npm/
+.eslintcache
+.turbo/
+.parcel-cache/
+
+# Test / coverage
+coverage/
+*.lcov
+.nyc_output/
+
+# TypeScript / runtime
+*.pid
+*.seed
+*.pid.lock
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Tauri / Rust build artifacts
+# (src-tauri/ is committed; its compiled output and generated mobile
+#  projects are not)
+apps/*/src-tauri/target/
+apps/*/src-tauri/gen/
+
+# Vite
+*.local
+vite.config.*.timestamp-*
+
+# Machine-specific setup scripts (not project tools)
+install-docker-after-reboot.bat
+
+# Editor / IDE
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# Local scratch: design screenshots + playwright/chrome profiles
+output/
+.claude/scheduled_tasks.lock
+.mcp.json
+
+# Terraform: local state, provider cache, plans, and var files (may hold secrets)
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# The top-level reference/scratch folder for character scraping + image gen.
+# Anchored to the repo root so it does NOT also match apps/api/src/characters/
+# (an unanchored `characters/` matches that dir at any depth and would silently
+# drop new source files there).
+/characters/

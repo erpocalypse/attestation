@@ -1,0 +1,15 @@
+# Enclave Python deps — EXACT-version pinned, including transitive deps, because
+# a floating dependency moves PCR0. A given version's wheel filename is immutable
+# on PyPI, so exact pins yield byte-identical installs across builds; combined
+# with PYTHONDONTWRITEBYTECODE + the mtime clamp in the Dockerfile, the python
+# layer is deterministic.
+#
+# HARDENING (next step): full hash-lock for tamper-evidence against a same-version
+# PyPI swap. Generate on the aarch64 build host and switch the Dockerfile to
+# `pip install --require-hashes`:
+#   ./build.sh lock      # -> writes hashes here via `pip download` + `pip hash`
+#
+# Target wheels: cp3x-abi3-manylinux_2_28_aarch64 (AL2023 / Graviton).
+cryptography==43.0.1
+cffi==1.17.1
+pycparser==2.22

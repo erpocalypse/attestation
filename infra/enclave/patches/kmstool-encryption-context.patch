@@ -1,0 +1,92 @@
+From: erpocalypse <ops@inkwell.rip>
+Date: Thu, 5 Jun 2026
+Subject: Add --encryption-context to kmstool-enclave-cli decrypt
+
+The stock kmstool-enclave-cli (v0.4.5) decrypt subcommand calls
+aws_kms_decrypt_blocking() which accepts NO encryption context.
+The SDK library has aws_kms_decrypt_blocking_with_context() since
+0.4.2 but the CLI tool was never updated to expose it.
+
+This patch adds --encryption-context as an optional JSON-string
+argument to the decrypt subcommand. Three things are load-bearing:
+  * the option char 'E' MUST also be added to the getopt short
+    string ("...l:E:h"): aws_cli_getopt_long() looks the long
+    option's val up in the short string and returns '?' (-> usage,
+    rc=1) if it's absent — the colon also marks it as taking an arg;
+  * the value is passed to the SDK as the aws_string* it already is
+    (the SDK parses the JSON itself). Passing a byte_cursor instead
+    misreads as a garbage context and KMS rejects the call with
+    InvalidCiphertextException.
+
+diff --git a/bin/kmstool-enclave-cli/main.c b/bin/kmstool-enclave-cli/main.c
+index 0c5f8f6..3ab70e8 100644
+--- a/bin/kmstool-enclave-cli/main.c
++++ b/bin/kmstool-enclave-cli/main.c
+@@ -57,6 +57,7 @@ struct app_ctx {
+ 
+     /* Data parameters */
+     const struct aws_string *ciphertext_b64;
++    const struct aws_string *encryption_context_json;
+     const struct aws_string *encryption_algorithm;
+     const struct aws_string *key_id;
+     enum aws_key_spec key_spec;
+@@ -92,6 +93,7 @@ static void s_usage_decrypt(int exit_code) {
+     fprintf(stderr, "    --ciphertext CIPHERTEXT: base64-encoded ciphertext that need to decrypt\n");
+     fprintf(stderr, "    --key-id KEY_ID: decrypt key id (for symmetric keys, is optional)\n");
+     fprintf(stderr, "    --encryption-algorithm ENCRYPTION_ALGORITHM: encryption algorithm for ciphertext\n");
++    fprintf(stderr, "    --encryption-context JSON: encryption context JSON (e.g. '{\"userId\":\"x\"}')\n");
+     exit(exit_code);
+ }
+ 
+@@ -138,6 +140,7 @@ static struct aws_cli_option s_long_options[] = {
+     {"ciphertext", AWS_CLI_OPTIONS_REQUIRED_ARGUMENT, NULL, 'c'},
+     {"key-id", AWS_CLI_OPTIONS_REQUIRED_ARGUMENT, NULL, 'K'},
+     {"key-spec", AWS_CLI_OPTIONS_REQUIRED_ARGUMENT, NULL, 'p'},
++    {"encryption-context", AWS_CLI_OPTIONS_REQUIRED_ARGUMENT, NULL, 'E'},
+     {"encryption-algorithm", AWS_CLI_OPTIONS_REQUIRED_ARGUMENT, NULL, 'a'},
+     {"length", AWS_CLI_OPTIONS_REQUIRED_ARGUMENT, NULL, 'l'},
+     {"help", AWS_CLI_OPTIONS_NO_ARGUMENT, NULL, 'h'},
+@@ -161,6 +164,7 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
+     ctx->ciphertext_b64 = NULL;
+     ctx->key_id = NULL;
+     ctx->key_spec = -1;
++    ctx->encryption_context_json = NULL;
+     ctx->encryption_algorithm = NULL;
+     ctx->length = -1;
+ 
+@@ -168,7 +172,7 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
+     while (true) {
+         int option_index = 0;
+ 
+-        int c = aws_cli_getopt_long(argc, argv, "r:x:k:s:t:c:K:p:a:l:h", s_long_options, &option_index);
++        int c = aws_cli_getopt_long(argc, argv, "r:x:k:s:t:c:K:p:a:l:E:h", s_long_options, &option_index);
+         if (c == -1) {
+             break;
+         }
+@@ -211,6 +215,9 @@ static void s_parse_options(int argc, char **argv, const char *subcommand, struc
+                          case 'K':
+                             ctx->key_id = aws_string_new_from_c_str(ctx->allocator, aws_cli_optarg);
+                             break;
++                        case 'E':
++                            ctx->encryption_context_json = aws_string_new_from_c_str(ctx->allocator, aws_cli_optarg);
++                            break;
+                         default:
+                             fprintf(stderr, "Unknown option: %s\n", aws_cli_optarg);
+                             s_usage_decrypt(1);
+@@ -386,8 +393,14 @@ static int decrypt(struct app_ctx *app_ctx, struct aws_byte_buf *ciphertext_decr
+ 
+     /* Decrypt the data with KMS. */
+     struct aws_byte_buf ciphertext_decrypted;
+-    rc = aws_kms_decrypt_blocking(
+-        client, app_ctx->key_id, app_ctx->encryption_algorithm, &ciphertext, &ciphertext_decrypted);
++    if (app_ctx->encryption_context_json != NULL) {
++        rc = aws_kms_decrypt_blocking_with_context(
++            client, app_ctx->key_id, app_ctx->encryption_algorithm, &ciphertext,
++            app_ctx->encryption_context_json, &ciphertext_decrypted);
++    } else {
++        rc = aws_kms_decrypt_blocking(
++            client, app_ctx->key_id, app_ctx->encryption_algorithm, &ciphertext, &ciphertext_decrypted);
++    }
+     
+     aws_byte_buf_clean_up(&ciphertext);
+     fail_on(rc != AWS_OP_SUCCESS, "Could not decrypt ciphertext");

@@ -1,0 +1,18 @@
+{
+  "name": "@erpocalypse/core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./lorebook": "./src/lorebook/index.ts",
+    "./character": "./src/character/index.ts",
+    "./chat": "./src/chat/index.ts",
+    "./crypto": "./src/crypto/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "clean": "rm -rf dist .turbo *.tsbuildinfo"
+  }
+}
