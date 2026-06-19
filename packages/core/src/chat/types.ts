@@ -72,7 +72,12 @@ export interface ChatContext {
 
 /** World (narrator) chat context, assembled server-side. */
 export interface WorldContext {
-  world: { name: string; setting?: string; nsfw?: boolean };
+  /** `sharedCanon` true = the one pre-seeded world that lives in the shared
+   *  "Verge" bible: the narrator gets WORLD_LORE + the "region of the world above"
+   *  framing. Every other world (default) runs purely on its own `setting`. Plain
+   *  metadata (not a secret), shipped into the enclave as data — the assembly LOGIC
+   *  change is what bumps PCR0, not this value (BAC-143). */
+  world: { name: string; setting?: string; nsfw?: boolean; sharedCanon?: boolean };
   cast: {
     name: string;
     personality?: string;

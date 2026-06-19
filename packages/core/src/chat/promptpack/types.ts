@@ -35,6 +35,10 @@ export interface PromptPack {
   absoluteLimits: string;
   /** Name-free narrator/format rules for World (narrator) chats. */
   worldNarratorRules: string;
+  /** Narrator/format rules for a standalone (non-shared-canon) world: same craft
+   *  as worldNarratorRules but framed on the world's own setting, not the shared
+   *  Verge bible (BAC-143). */
+  worldNarratorRulesNeutral: string;
   /** Difficulty-1..9 behavioural guidance, indexed 0..8 (no interpolation). */
   difficultyGuidance: string[];
   /** Terminal self-edit FINAL PASS for the single-character path. */

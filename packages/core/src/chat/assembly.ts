@@ -32,8 +32,6 @@ export function difficultyGuidance(n: number): string {
  *  the string join changed. */
 function scaffoldAdult(): string {
   return [
-    pack().worldCore,
-    "",
     pack().roleplayRules,
     "",
     pack().adultCapability,
@@ -43,8 +41,6 @@ function scaffoldAdult(): string {
 }
 function scaffoldSfw(): string {
   return [
-    pack().worldCore,
-    "",
     pack().roleplayRules,
     "",
     pack().sfwCapability,
@@ -59,6 +55,14 @@ function scaffoldSfw(): string {
  *  strings), byte-identical to the old module-load constant. */
 function worldScaffold(): string {
   return [pack().worldLore, "", pack().worldNarratorRules].join("\n");
+}
+
+/** Narrator scaffold for a standalone world (the default): just the neutral
+ *  narrator rules, NO shared Verge bible — the world's own `setting` is the sole
+ *  canon, injected after. Used for every world EXCEPT the pre-seeded shared-canon
+ *  (Verge) world (BAC-143). */
+function worldScaffoldNeutral(): string {
+  return pack().worldNarratorRulesNeutral;
 }
 
 /** Hard ceiling on injected lorebook text (the engine's token budget runs on the
@@ -113,7 +117,7 @@ export function systemPrompt(
     "--- THIS CHARACTER ---",
     "",
     // === PER-CHARACTER (stable for the life of the character) ===
-    `You are ${c.name}, one of the people living in the world above, a fictional character in an ongoing interactive roleplay.`,
+    `You are ${c.name}, a fictional character in an ongoing interactive roleplay.`,
     c.tagline && `Premise: ${c.tagline}`,
     c.description && `Background: ${c.description}`,
     c.personality && `Personality: ${c.personality}`,
@@ -262,18 +266,24 @@ export function worldSystemPrompt(
   lore?: LoreInjection,
 ): string {
   const w = dto.world;
+  // Only the one pre-seeded Verge world carries the shared bible; every other
+  // world is a standalone universe that runs on its own `setting` (BAC-143).
+  const sharedCanon = w.sharedCanon === true;
   // === GLOBAL STATIC SCAFFOLD (shared across every world chat) ===
-  // Full world bible + name-free narrator/format rules. Identical for every
-  // world conversation, so DeepSeek caches it once on the shared platform key
-  // (same rationale as SCAFFOLD_* for single-character chats). Nothing world-,
-  // cast-, or turn-specific may appear before this point.
+  // Narrator/format rules (+ the full Verge bible for the shared-canon world).
+  // Identical for every world conversation in the same cohort, so DeepSeek caches
+  // it once on the shared platform key (same rationale as SCAFFOLD_* for single-
+  // character chats). Nothing world-, cast-, or turn-specific may appear before
+  // this point.
   const lines: (string | undefined)[] = [
-    worldScaffold(),
+    sharedCanon ? worldScaffold() : worldScaffoldNeutral(),
     "",
-    "--- THIS REGION ---",
+    sharedCanon ? "--- THIS REGION ---" : "--- THIS WORLD ---",
     "",
     // === PER-WORLD (stable for the life of the world) ===
-    `You are narrating "${w.name}", a region of the world above.`,
+    sharedCanon
+      ? `You are narrating "${w.name}", a region of the world above.`
+      : `You are narrating "${w.name}".`,
     w.setting && `SETTING for "${w.name}" specifically:\n${w.setting}`,
     "",
     // === PER-CONVERSATION (cast in scene + the user's persona) ===
