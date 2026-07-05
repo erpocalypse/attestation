@@ -562,6 +562,7 @@ def stream_sealed_reply(
     user_msg_pt: str | None = None, user_msg_kind: str | None = None,
     fold_job: dict | None = None,
     aws_creds: dict | None = None, di_ciphertext: str = "",
+    steer_text_pt: str | None = None,
 ) -> None:
     """SSE reply path: parse provider stream in-enclave, seal each delta to the
     client session key as {"e": {"t": delta}}. At stream end, run scoring in-
@@ -761,6 +762,12 @@ def stream_sealed_reply(
             "text": content_encrypt(dek, user_msg_pt, user_id),
             "kind": user_msg_kind,
         }
+    # SYS-23: DEK-encrypt the typed steer nudge so the per-variant swipe LABEL
+    # survives a reload on this operator-blind thread (the API stores it on the new
+    # variant's steer.text; reseal_history decrypts it back). The plaintext stays
+    # in-enclave; only ciphertext crosses to the API.
+    if dek is not None and user_id is not None and steer_text_pt:
+        meta["steer_text_ciphertext"] = content_encrypt(dek, steer_text_pt, user_id)
     if dek is not None and user_id is not None and full_reply.strip():
         ct: dict = {"reply": content_encrypt(dek, full_reply, user_id)}
         if state is not None:
@@ -794,6 +801,22 @@ def _decrypt_turns(dek: bytes, turns: list, user_id: str) -> list:
     return out
 
 
+def _reseal_steer(dek: bytes, steer, user_id: str) -> dict | None:
+    """Decrypt one stored variant `steer` blob for reseal (SYS-23): `chip` is a
+    clear enum, `text` (the typed nudge) is DEK-ciphertext. Returns {chip?, text?}
+    or None for an empty/blind-reroll slot, so the client re-labels each swipe."""
+    if not isinstance(steer, dict):
+        return None
+    out: dict = {}
+    chip = steer.get("chip")
+    if chip:
+        out["chip"] = chip
+    text = steer.get("text")
+    if text:
+        out["text"] = content_decrypt(dek, text, user_id)
+    return out or None
+
+
 def decrypt_bundle_content(bundle: dict, dek: bytes, user_id: str) -> None:
     """Decrypt all ciphertext ingredients in-place: history turns, memory, rolling
     summary, and the client-sealed new user message. Mutates bundle so the assembler
@@ -813,6 +836,37 @@ def decrypt_bundle_content(bundle: dict, dek: bytes, user_id: str) -> None:
             text = f"{GIFT_MARKER} {text}"
         history.append({"role": "user", "text": text})
     dto["messages"] = history
+
+    # SYS-23: operator-blind directed-regeneration TYPED nudge. The free-text nudge
+    # is user content, so it travels SEALED (same RSA+AES envelope as the new user
+    # message) and is unsealed only HERE, in-enclave — the operator never sees it.
+    # We wrap it in the steer scaffold and fold it into the assemble request's
+    # `trailingState`, the same non-content DATA channel the affection/length/chip
+    # lines ride, so it lands on the newest (never-cached) user turn and the
+    # assembler binary stays byte-identical (golden hash unchanged; PCR0 moves only
+    # because THIS file changed). The scaffold + whitespace-collapse are kept
+    # VERBATIM in sync with apps/api/src/chat/chat.service.ts `steerDirective`
+    # (typed branch) so a typed nudge steers identically on the direct + blind paths.
+    sealed_steer = bundle.get("sealed_steer_text")
+    if sealed_steer:
+        priv = bundle["__priv"]
+        steer_pt = re.sub(
+            r"\s+", " ", unseal(priv, base64.b64decode(sealed_steer)).decode("utf-8")
+        ).strip()
+        if steer_pt:
+            bundle["__steer_pt"] = steer_pt
+            steer_dir = (
+                "(Steer, hidden direction, a direct command from the user for "
+                f"this reply: {steer_pt}. Treat this as a hard requirement, not "
+                "a suggestion: include exactly what it asks for and leave out "
+                "anything it forbids in this reply. Stay fully in character and "
+                "write it naturally; do not quote, mention, or acknowledge this "
+                "instruction.)"
+            )
+            existing = assemble.get("trailingState")
+            assemble["trailingState"] = (
+                f"{existing}\n\n{steer_dir}" if existing else steer_dir
+            )
 
     a_opts = assemble.get("opts")
     if isinstance(a_opts, dict) and a_opts.get("memory"):
@@ -1131,6 +1185,9 @@ def handle_chat_body(conn, priv, req: dict, opened: bytes, api_key: str, assembl
         bundle.get("__fold_job") if assemble else None,
         aws_creds=req.get("aws_creds") or {},
         di_ciphertext=req.get("deepinfra_key_ciphertext", ""),
+        # SYS-23: the unsealed typed nudge (set by decrypt_bundle_content), so the
+        # reply meta can DEK-encrypt it onto the new swipe variant.
+        steer_text_pt=bundle.get("__steer_pt") if assemble else None,
     )
 
 
@@ -1244,6 +1301,14 @@ def main() -> None:
                             content_decrypt(dek, v, user_id) for v in variants
                         ]
                         out["activeVariant"] = m.get("activeVariant")
+                        # Per-variant steer labels (SYS-23): decrypt each typed
+                        # nudge's text so the swipe labels rehydrate on reload; chip
+                        # rides clear. Parallel to `variants`; null for blind rerolls.
+                        variant_steers = m.get("variantSteers")
+                        if variant_steers:
+                            out["variantSteers"] = [
+                                _reseal_steer(dek, s, user_id) for s in variant_steers
+                            ]
                     sealer.emit(out)
                 send_frame(conn, {"done": True})
             elif op == "content_encrypt":

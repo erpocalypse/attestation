@@ -24,11 +24,11 @@ const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
 // These MUST equal infra/enclave/measurements.json and the deployed ENCLAVE_PCR0.
 // On a PCR0 cutover, bump these WITH measurements.json before flipping the fleet.
 const EXPECTED_PCR0 =
-  "4d7e01f2c820471d4d90d8cdca1b453c857dd817379a62ec4e45a8ebfcf97883eb3da950343cb2b9bb786999bf7f1033";
+  "e221ce1e11e5c095339b53b05bcee21d8b616bed485b725f28518d40f7057e5d93b2f4bbf66c4651fe264eb9f9b16bec";
 const EXPECTED_PCR1 =
   "3b4a7e1b5f13c5a1000b3ed32ef8995ee13e9876329f9bc72650b918329ef9cf4e2e4d1e1e37375dab0ba56ba0974d03";
 const EXPECTED_PCR2 =
-  "3c47e781f9a3b1a09955af4bc3787f7a9e801642bda90d5eec33b37c706428b89e4bb949e33640e1a76d8ce386014dd2";
+  "4984f2273d2526e764a237dee6c3c0b00ac5a62a9c3eca52e73d1a5e4fcf6f81eed59f2f6404122100d922fdffdf3b34";
 
 export interface Check {
   ok: boolean;

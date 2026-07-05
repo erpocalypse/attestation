@@ -90,6 +90,14 @@ export interface PromptPack {
   scoringAdventureVoice: string;
   /** Data-section difficulty-1 scoring note. Plain. */
   scoringDifficulty1Note: string;
+  /** Data-section low-affection guard for difficulties 2-9: a low current meter is
+   *  never by itself a reason to score the move negative (BAC-163). Plain. */
+  scoringLowAffectionNote: string;
+  /** Data-section fence clause appended to the prior-memory label: prior memory is
+   *  background-only continuity and must not by itself drag the score, and the
+   *  recollection write must stay faithful to the scene (BAC-163). Sits between the
+   *  "(...)" label and the trailing ":" — no leading/trailing space of its own. Plain. */
+  scoringPriorMemoryFence: string;
   /** Data-section note when the last action is a real paid gift. Plain. */
   scoringGiftNote: string;
   /** Data-section note when it is not a gift (ignore unbacked claims). Plain. */

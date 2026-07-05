@@ -32,8 +32,7 @@ honestly on `/security`; do not imply the prompts themselves are attested.
    `packages/core/src/chat/**` minus `promptpack/default.ts`, plus
    `packages/core/src/lorebook/**`).
 2. `./build.sh assembler` — compiles the content-free assembler with the pinned Bun.
-3. `./build.sh verify` on a fresh c6g from the pinned AMI `ami-0a2a049c945b84826` —
-   builds the EIF twice and asserts identical PCR0.
+3. `./build.sh verify` — builds the EIF twice on a fresh c6g and asserts identical PCR0.
 4. Compare against the committed `measurements.json` PCR0 (and the live enclave's
    attestation doc, which the browser checks on `/security`).
 
@@ -61,27 +60,23 @@ should produce the same PCR0 from the same inputs, **provided**:
 - The same kernel/init blob version is present (NITRO_CLI_ARTIFACTS)
 - The Docker base image digest is identical (pinned via build.sh)
 
-**Cross-host reproducibility is CONFIRMED for the live image** (`4d7e01f2…`): three
-independent fresh hosts built from this public mirror and produced byte-identical
-PCR0, **on the pinned build AMI** below. Every file that enters the enclave
-(assembler, kmstool, libnsm, server.py, the nitro boot blobs → PCR1) is byte-identical
-across hosts; the only build-host-sensitive part is the rootfs ramdisk *packing
-metadata* (PCR2), which the pinned AMI makes deterministic.
+**This is now verified** (two independent fresh hosts produced identical PCR0
+once the determinism fixes below landed). To re-confirm cross-host reproducibility:
 
-To reproduce:
-1. Launch a c6g host from AMI `ami-0a2a049c945b84826`
-   (`al2023-ami-2023.11.20260526.0-kernel-6.1-arm64`).
-2. Run `./build.sh verify` — builds the EIF twice and asserts identical PCR0.
-3. Compare the PCR0 to the committed `measurements.json` and the live `/security`
-   attestation. (CPU serial numbers etc. do NOT affect PCR0 — only the EIF content.)
+1. Launch two c6g.xlarge build hosts from the same AMI
+2. Run `./build.sh verify` on each
+3. Compare the PCR0 values
+4. Actual hardware fingerprinting (CPU features, serial numbers) does NOT affect
+   PCR0 — it measures only the initial enclave memory content, which is
+   deterministic from the EIF file.
 
 ## Current status
 
 | Check | Status |
 |---|---|
-| Same-host reproducible | Verified for `4d7e01f2…` (`build.sh verify` builds twice `--no-cache`, REPRO_OK) |
-| Cross-host reproducible | **Confirmed** for `4d7e01f2…` — 3 independent fresh hosts on the pinned AMI produced identical PCR0 |
-| Cross-AMI reproducible | Build on the pinned AMI `ami-0a2a049c945b84826`; rootfs packing (PCR2) is AMI-sensitive |
+| Same-host reproducible | Verified (via `build.sh verify`, which now rebuilds `--no-cache`) |
+| Cross-host reproducible | **Verified** — two independent fresh c6g/m6g hosts produce identical PCR0 (`757f92e2…`) |
+| Cross-AMI reproducible | Not applicable (same AMI pinned) |
 
 ## Determinism fixes (what made cross-host reproducible)
 

@@ -117,13 +117,13 @@ export function buildScoringMessages(input: ScoringInput): {
   const data = [
     `The character the user is talking to is named ${name}. Difficulty: ${difficulty}/9. ${difficultyGuidance(difficulty)}`,
     `${name}'s current affection toward the user is ${love}/100.`,
-    difficulty === 1 ? pack().scoringDifficulty1Note : "",
+    difficulty === 1 ? pack().scoringDifficulty1Note : pack().scoringLowAffectionNote,
     "",
     "Recent conversation:",
     transcript,
     `${name} (just now): ${scoredReply}`,
     memoryEnabled
-      ? `\nPrior memory (${name}'s recollection of this user and what's happened between them):\n${priorMemory || "(nothing yet)"}`
+      ? `\nPrior memory (${name}'s recollection of this user and what's happened between them) ${pack().scoringPriorMemoryFence}:\n${priorMemory || "(nothing yet)"}`
       : "",
     isGift ? pack().scoringGiftNote : pack().scoringNoGiftNote,
     adventure && (styleProfile || requested.styleSamples?.length)
