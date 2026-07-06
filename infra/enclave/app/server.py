@@ -456,6 +456,25 @@ def strip_em_dash(text: str) -> str:
     return _EM_DASH_RE.sub(", ", text)
 
 
+# Stray-CJK backstop (BAC-178/BAC-179): the platform model occasionally emits a
+# single Chinese character mid-English-prose. Strips Han ideographs (base block
+# + ext A) only when they stand ALONE, with CJK punctuation / fullwidth forms
+# counting as CJK context, so genuinely multilingual replies survive. Applied to
+# the ACCUMULATED reply before at-rest encryption, never per streamed delta (a
+# delta boundary can split a legitimate run); the web client applies the same
+# scrub to the live stream for display. Mirrors the API's scrubStrayCjk
+# (apps/api/src/chat/chat.service.ts) — keep the two regexes in sync.
+_STRAY_CJK_RE = re.compile(
+    "(^|[^㐀-鿿　-〿＀-￯])"
+    "[㐀-鿿]"
+    "(?![㐀-鿿　-〿＀-￯])"
+)
+
+
+def scrub_stray_cjk(text: str) -> str:
+    return _STRAY_CJK_RE.sub(r"\1", text)
+
+
 # ---- provider call helpers (sealed reply path) ------------------------------
 def _provider_tls() -> ssl.SSLSocket:
     raw = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
@@ -768,6 +787,9 @@ def stream_sealed_reply(
     # in-enclave; only ciphertext crosses to the API.
     if dek is not None and user_id is not None and steer_text_pt:
         meta["steer_text_ciphertext"] = content_encrypt(dek, steer_text_pt, user_id)
+    # Stray-CJK backstop on the accumulated reply before it persists at rest
+    # (the API can't rewrite this thread's ciphertext later).
+    full_reply = scrub_stray_cjk(full_reply)
     if dek is not None and user_id is not None and full_reply.strip():
         ct: dict = {"reply": content_encrypt(dek, full_reply, user_id)}
         if state is not None:
