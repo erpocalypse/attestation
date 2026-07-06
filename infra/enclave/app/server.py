@@ -38,12 +38,6 @@ if PROVIDER_HOST is None:
     raise RuntimeError("PROVIDER_HOST is required")
 PROVIDER_PATH = os.environ.get("PROVIDER_PATH", "/chat/completions")
 PROVIDER_KEY_CIPHERTEXT_B64 = os.environ.get("PROVIDER_KEY_CIPHERTEXT_B64", "")
-# PromptPack (BAC-136): the proprietary prompt CONTENT (jailbreak, world canon,
-# scoring/anti-slop rubric). KMS-wrapped and injected per request by the host
-# forwarder (exactly like the provider key) and unwrapped here, attestation-gated to
-# this PCR0. The compiled assembler binary carries NONE of it, so PCR0 is
-# reproducible from public source; the content arrives as runtime data instead.
-PROMPTPACK_CIPHERTEXT_B64 = os.environ.get("PROMPTPACK_CIPHERTEXT_B64", "")
 ATT_DOC_MAX = 16 * 1024
 
 # ---- CSAM moderation (operator-blind text screen) --------------------------
@@ -67,25 +61,33 @@ CSAM_BLOCK_MESSAGE = (
 )
 # Kept verbatim in sync with apps/api/src/moderation/csam-prompt.ts (CSAM_PROMPT).
 CSAM_PROMPT = (
-    'You are a strict child-safety classifier for an adults-only (18+) fictional '
-    "roleplay platform. Adult sexual content between adults is ALLOWED and must "
-    "NOT be flagged. Your ONLY task is to detect child sexual abuse material "
-    "(CSAM): content that sexualizes, or places in a sexual or suggestive "
-    "context, anyone who is or appears to be a minor (under 18).\n\n"
+    "You are a child-safety classifier for an adults-only (18+) fictional "
+    "roleplay platform. Adult sexual content between consenting adults is "
+    "ALLOWED, normal here, and must NEVER be flagged. Your ONLY task is to "
+    "detect content that sexualizes an actual minor: a character who is under 18.\n\n"
+    "This platform is 18+: every user is an adult and characters are presumptively "
+    "adults. Youthful wording alone — \"young woman,\" \"innocent,\" \"little\" "
+    "(clothing or demeanor), \"barely legal,\" or a college setting — does NOT "
+    "indicate a minor. Do NOT flag adult characters described with those words.\n\n"
+    "Set \"csam\": true ONLY when there is affirmative indication the subject is "
+    "under 18: a stated or shown age below 18 (e.g. \"13 years old,\" prepubescent "
+    "body), explicit minor-coding terms (child, kid, preteen, loli, shota, "
+    "toddler), or a sexualized depiction clearly involving someone under 18.\n\n"
+    "Set \"csam\": false for any sexual content involving adults (18+, including "
+    "\"just turned 18,\" college-aged, or adult characters). If there is no clear "
+    "indication the subject is a minor, default to false — assume adult on this "
+    "18+ platform.\n\n"
     "Examine the user's message text and any images. Reply with ONLY compact "
-    'JSON: {"csam": <true|false>, "reason": "<short reason>"}.\n\n'
-    'Set "csam": true when sexual or suggestive content involves a subject who '
-    "is or could be under 18 — signals include a stated age under 18, school "
-    'grade or "student"/"schoolgirl" framing, words like child, kid, little, '
-    "young, preteen, loli, or shota, or a childlike/underage depiction combined "
-    "with any sexual or suggestive content. When a sexualized subject's age is "
-    'genuinely ambiguous, set "csam": true.\n\n'
-    'Set "csam": false for sexual content that clearly involves only adults, and '
-    "for any non-sexual content. Output JSON only, no other text."
+    'JSON: {"csam": <true|false>, "reason": "<short reason>"}. No other text.'
 )
+# A provider safety-refusal is only a block when it SPECIFICALLY names CSAM /
+# minors. On this 18+ platform the classifier routinely refuses legitimate
+# explicit adult content with generic "I cannot assist" / "against policy"
+# language — those generic refusals are NOT CSAM signal and must fail open.
 _CSAM_REFUSAL_RE = re.compile(
-    r"\bcsam\b|child (?:sexual|abuse|porn)|minor|cannot (?:assist|comply|process|help)"
-    r"|won'?t (?:assist|help)|not able to|unable to|against (?:my|our) (?:policy|guidelines)",
+    r"\bcsam\b|child sexual (?:abuse|exploitation|assault)|child (?:abuse|porn)"
+    r"|sexual(?:ization|ised|izing)? of (?:a )?(?:minor|child|underage)"
+    r"|underage (?:sexual|minor|girl|boy)|prepubescent|\bloli\b|\bshota\b",
     re.IGNORECASE,
 )
 _CSAM_JSON_RE = re.compile(r'"csam"\s*:\s*(true|false)', re.IGNORECASE)
@@ -199,47 +201,6 @@ def deepinfra_key(creds: dict, ciphertext: str = "") -> str:
     return _deepinfra_key
 
 
-# ---- PromptPack: the assembler's prompt content, unwrapped attestation-gated ----
-# The bun-compiled assembler ships with NO proprietary strings (so PCR0 is
-# reproducible from the public source). The content rides in as a KMS-wrapped JSON
-# blob the forwarder injects into assembler ops; we unwrap it here and feed it to
-# the assembler on stdin. Unwrapped once and cached for the process lifetime, like
-# the provider key.
-_prompt_pack: dict | None = None
-_pp_source: dict = {"creds": None, "ciphertext": ""}
-
-
-def set_prompt_pack_source(creds: dict, ciphertext: str) -> None:
-    """Record where to KMS-unwrap the PromptPack from for THIS request (called once
-    per request in main()). The unwrap itself is LAZY — only assembler ops trigger
-    it — so non-assembling ops (reseal_history / content_encrypt / unwrap_dek) keep
-    working even when no pack ciphertext is injected."""
-    global _pp_source
-    _pp_source = {"creds": creds or {}, "ciphertext": ciphertext or ""}
-
-
-def active_prompt_pack() -> dict:
-    """The unwrapped PromptPack fed to the assembler. The pack (~40 KB JSON) far
-    exceeds KMS's 4 KB direct-encrypt limit, so it is delivered ENVELOPE-encrypted:
-    a base64 JSON {"wrapped": <KMS ciphertext of a 256-bit data key>, "ct": <base64
-    iv(12) || AES-256-GCM(ct||tag)>}. We KMS-unwrap the data key (attestation-gated
-    to this PCR0 — the host's creds are useless anywhere else) and AES-open the pack.
-    Cached after the first unwrap. Raises when nothing was injected — FAIL CLOSED:
-    the binary has no built-in content, so a missing pack must error, never assemble
-    a blank/identity-free prompt."""
-    global _prompt_pack
-    if _prompt_pack is None:
-        raw = _pp_source["ciphertext"] or PROMPTPACK_CIPHERTEXT_B64
-        if not raw:
-            raise RuntimeError("promptpack unavailable: no ciphertext injected")
-        env = json.loads(base64.b64decode(raw))
-        key = kms_decrypt(_pp_source["creds"], env["wrapped"])
-        blob = base64.b64decode(env["ct"])
-        pack_json = AESGCM(key).decrypt(blob[:12], blob[12:], None).decode("utf-8")
-        _prompt_pack = json.loads(pack_json)
-    return _prompt_pack
-
-
 def _deepinfra_post(api_key: str, body: bytes) -> bytes:
     """POST to DeepInfra over its OWN vsock tunnel (port 8003 → api.deepinfra.com);
     return the full raw HTTP response. Bounded by a socket timeout so the screen
@@ -335,12 +296,8 @@ ASSEMBLER = "/usr/local/bin/inkwell-assemble"
 
 def assemble_messages(requests: list) -> list:
     """Run the bun-compiled assembler — same @erpocalypse/core/chat TypeScript the
-    API runs, producing a byte-identical prompt. The PromptPack (proprietary prompt
-    content, KMS-unwrapped) rides in the stdin envelope; the binary carries none, so
-    a missing pack raises here (fail closed) rather than assembling blank."""
-    payload = json.dumps(
-        {"requests": requests, "promptPack": active_prompt_pack()}
-    ).encode()
+    API runs, producing a byte-identical prompt."""
+    payload = json.dumps({"requests": requests}).encode()
     p = subprocess.run([ASSEMBLER], input=payload, capture_output=True)
     if p.returncode != 0:
         raise RuntimeError(
@@ -456,25 +413,6 @@ def strip_em_dash(text: str) -> str:
     return _EM_DASH_RE.sub(", ", text)
 
 
-# Stray-CJK backstop (BAC-178/BAC-179): the platform model occasionally emits a
-# single Chinese character mid-English-prose. Strips Han ideographs (base block
-# + ext A) only when they stand ALONE, with CJK punctuation / fullwidth forms
-# counting as CJK context, so genuinely multilingual replies survive. Applied to
-# the ACCUMULATED reply before at-rest encryption, never per streamed delta (a
-# delta boundary can split a legitimate run); the web client applies the same
-# scrub to the live stream for display. Mirrors the API's scrubStrayCjk
-# (apps/api/src/chat/chat.service.ts) — keep the two regexes in sync.
-_STRAY_CJK_RE = re.compile(
-    "(^|[^㐀-鿿　-〿＀-￯])"
-    "[㐀-鿿]"
-    "(?![㐀-鿿　-〿＀-￯])"
-)
-
-
-def scrub_stray_cjk(text: str) -> str:
-    return _STRAY_CJK_RE.sub(r"\1", text)
-
-
 # ---- provider call helpers (sealed reply path) ------------------------------
 def _provider_tls() -> ssl.SSLSocket:
     raw = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
@@ -581,7 +519,6 @@ def stream_sealed_reply(
     user_msg_pt: str | None = None, user_msg_kind: str | None = None,
     fold_job: dict | None = None,
     aws_creds: dict | None = None, di_ciphertext: str = "",
-    steer_text_pt: str | None = None,
 ) -> None:
     """SSE reply path: parse provider stream in-enclave, seal each delta to the
     client session key as {"e": {"t": delta}}. At stream end, run scoring in-
@@ -781,15 +718,6 @@ def stream_sealed_reply(
             "text": content_encrypt(dek, user_msg_pt, user_id),
             "kind": user_msg_kind,
         }
-    # SYS-23: DEK-encrypt the typed steer nudge so the per-variant swipe LABEL
-    # survives a reload on this operator-blind thread (the API stores it on the new
-    # variant's steer.text; reseal_history decrypts it back). The plaintext stays
-    # in-enclave; only ciphertext crosses to the API.
-    if dek is not None and user_id is not None and steer_text_pt:
-        meta["steer_text_ciphertext"] = content_encrypt(dek, steer_text_pt, user_id)
-    # Stray-CJK backstop on the accumulated reply before it persists at rest
-    # (the API can't rewrite this thread's ciphertext later).
-    full_reply = scrub_stray_cjk(full_reply)
     if dek is not None and user_id is not None and full_reply.strip():
         ct: dict = {"reply": content_encrypt(dek, full_reply, user_id)}
         if state is not None:
@@ -823,22 +751,6 @@ def _decrypt_turns(dek: bytes, turns: list, user_id: str) -> list:
     return out
 
 
-def _reseal_steer(dek: bytes, steer, user_id: str) -> dict | None:
-    """Decrypt one stored variant `steer` blob for reseal (SYS-23): `chip` is a
-    clear enum, `text` (the typed nudge) is DEK-ciphertext. Returns {chip?, text?}
-    or None for an empty/blind-reroll slot, so the client re-labels each swipe."""
-    if not isinstance(steer, dict):
-        return None
-    out: dict = {}
-    chip = steer.get("chip")
-    if chip:
-        out["chip"] = chip
-    text = steer.get("text")
-    if text:
-        out["text"] = content_decrypt(dek, text, user_id)
-    return out or None
-
-
 def decrypt_bundle_content(bundle: dict, dek: bytes, user_id: str) -> None:
     """Decrypt all ciphertext ingredients in-place: history turns, memory, rolling
     summary, and the client-sealed new user message. Mutates bundle so the assembler
@@ -858,37 +770,6 @@ def decrypt_bundle_content(bundle: dict, dek: bytes, user_id: str) -> None:
             text = f"{GIFT_MARKER} {text}"
         history.append({"role": "user", "text": text})
     dto["messages"] = history
-
-    # SYS-23: operator-blind directed-regeneration TYPED nudge. The free-text nudge
-    # is user content, so it travels SEALED (same RSA+AES envelope as the new user
-    # message) and is unsealed only HERE, in-enclave — the operator never sees it.
-    # We wrap it in the steer scaffold and fold it into the assemble request's
-    # `trailingState`, the same non-content DATA channel the affection/length/chip
-    # lines ride, so it lands on the newest (never-cached) user turn and the
-    # assembler binary stays byte-identical (golden hash unchanged; PCR0 moves only
-    # because THIS file changed). The scaffold + whitespace-collapse are kept
-    # VERBATIM in sync with apps/api/src/chat/chat.service.ts `steerDirective`
-    # (typed branch) so a typed nudge steers identically on the direct + blind paths.
-    sealed_steer = bundle.get("sealed_steer_text")
-    if sealed_steer:
-        priv = bundle["__priv"]
-        steer_pt = re.sub(
-            r"\s+", " ", unseal(priv, base64.b64decode(sealed_steer)).decode("utf-8")
-        ).strip()
-        if steer_pt:
-            bundle["__steer_pt"] = steer_pt
-            steer_dir = (
-                "(Steer, hidden direction, a direct command from the user for "
-                f"this reply: {steer_pt}. Treat this as a hard requirement, not "
-                "a suggestion: include exactly what it asks for and leave out "
-                "anything it forbids in this reply. Stay fully in character and "
-                "write it naturally; do not quote, mention, or acknowledge this "
-                "instruction.)"
-            )
-            existing = assemble.get("trailingState")
-            assemble["trailingState"] = (
-                f"{existing}\n\n{steer_dir}" if existing else steer_dir
-            )
 
     a_opts = assemble.get("opts")
     if isinstance(a_opts, dict) and a_opts.get("memory"):
@@ -1207,9 +1088,6 @@ def handle_chat_body(conn, priv, req: dict, opened: bytes, api_key: str, assembl
         bundle.get("__fold_job") if assemble else None,
         aws_creds=req.get("aws_creds") or {},
         di_ciphertext=req.get("deepinfra_key_ciphertext", ""),
-        # SYS-23: the unsealed typed nudge (set by decrypt_bundle_content), so the
-        # reply meta can DEK-encrypt it onto the new swipe variant.
-        steer_text_pt=bundle.get("__steer_pt") if assemble else None,
     )
 
 
@@ -1284,11 +1162,6 @@ def main() -> None:
         try:
             req = recv_frame(conn)
             op = req.get("op")
-            # Where to KMS-unwrap the PromptPack for this request (lazy — only the
-            # assembler ops actually unwrap it; injected by the forwarder for those).
-            set_prompt_pack_source(
-                req.get("aws_creds") or {}, req.get("promptpack_ciphertext", "")
-            )
             if op == "ping":
                 send_frame(conn, {"ok": True})
             elif op == "attest":
@@ -1323,14 +1196,6 @@ def main() -> None:
                             content_decrypt(dek, v, user_id) for v in variants
                         ]
                         out["activeVariant"] = m.get("activeVariant")
-                        # Per-variant steer labels (SYS-23): decrypt each typed
-                        # nudge's text so the swipe labels rehydrate on reload; chip
-                        # rides clear. Parallel to `variants`; null for blind rerolls.
-                        variant_steers = m.get("variantSteers")
-                        if variant_steers:
-                            out["variantSteers"] = [
-                                _reseal_steer(dek, s, user_id) for s in variant_steers
-                            ]
                     sealer.emit(out)
                 send_frame(conn, {"done": True})
             elif op == "content_encrypt":
