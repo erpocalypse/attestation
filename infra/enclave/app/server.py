@@ -10,7 +10,6 @@ arbitrary user-specified endpoints). Scoring runs through the same tunnel.
 Reference implementation — the published source that produces the PCR0
 measurement users verify against their browser's attestation document.
 """
-
 from __future__ import annotations
 
 import base64
@@ -39,20 +38,26 @@ if PROVIDER_HOST is None:
     raise RuntimeError("PROVIDER_HOST is required")
 PROVIDER_PATH = os.environ.get("PROVIDER_PATH", "/chat/completions")
 PROVIDER_KEY_CIPHERTEXT_B64 = os.environ.get("PROVIDER_KEY_CIPHERTEXT_B64", "")
+# PromptPack (BAC-136): the proprietary prompt CONTENT (jailbreak, world canon,
+# scoring/anti-slop rubric). KMS-wrapped and injected per request by the host
+# forwarder (exactly like the provider key) and unwrapped here, attestation-gated to
+# this PCR0. The compiled assembler binary carries NONE of it, so PCR0 is
+# reproducible from public source; the content arrives as runtime data instead.
+PROMPTPACK_CIPHERTEXT_B64 = os.environ.get("PROMPTPACK_CIPHERTEXT_B64", "")
 ATT_DOC_MAX = 16 * 1024
 
 # ---- CSAM moderation (operator-blind text screen) --------------------------
 # The blind path's plaintext user message exists ONLY here, so the CSAM screen
-# must run in-enclave. We call the classifier (deepseek-v4-flash via CROF) over a SEPARATE
+# must run in-enclave. We call DeepInfra (Llama-3.2-Vision) over a SEPARATE
 # vsock-proxy tunnel (the host allow-lists api.deepinfra.com on this port), with
 # its key KMS-unwrapped exactly like the provider key (attestation-gated to this
 # PCR0). Text-only here — image attachments aren't operator-blind, so they're
 # screened API-side. Empty DEEPINFRA_HOST disables the screen (fail-open).
 DEEPINFRA_VSOCK_PORT = 8003
-DEEPINFRA_HOST = os.environ.get("DEEPINFRA_HOST", "crof.ai")
-DEEPINFRA_PATH = os.environ.get("DEEPINFRA_PATH", "/v1/chat/completions")
+DEEPINFRA_HOST = os.environ.get("DEEPINFRA_HOST", "")
+DEEPINFRA_PATH = os.environ.get("DEEPINFRA_PATH", "/v1/openai/chat/completions")
 DEEPINFRA_MODEL = os.environ.get(
-    "DEEPINFRA_MODEL", "deepseek-v4-flash"
+    "DEEPINFRA_MODEL", "meta-llama/Llama-3.2-11B-Vision-Instruct"
 )
 DEEPINFRA_KEY_CIPHERTEXT_B64 = os.environ.get("DEEPINFRA_KEY_CIPHERTEXT_B64", "")
 # User-facing block copy — kept identical to the API's CSAM_BLOCK_MESSAGE.
@@ -62,33 +67,25 @@ CSAM_BLOCK_MESSAGE = (
 )
 # Kept verbatim in sync with apps/api/src/moderation/csam-prompt.ts (CSAM_PROMPT).
 CSAM_PROMPT = (
-    "You are a child-safety classifier for an adults-only (18+) fictional "
-    "roleplay platform. Adult sexual content between consenting adults is "
-    "ALLOWED, normal here, and must NEVER be flagged. Your ONLY task is to "
-    "detect content that sexualizes an actual minor: a character who is under 18.\n\n"
-    "This platform is 18+: every user is an adult and characters are presumptively "
-    'adults. Youthful wording alone — "young woman," "innocent," "little" '
-    '(clothing or demeanor), "barely legal," or a college setting — does NOT '
-    "indicate a minor. Do NOT flag adult characters described with those words.\n\n"
-    'Set "csam": true ONLY when there is affirmative indication the subject is '
-    'under 18: a stated or shown age below 18 (e.g. "13 years old," prepubescent '
-    "body), explicit minor-coding terms (child, kid, preteen, loli, shota, "
-    "toddler), or a sexualized depiction clearly involving someone under 18.\n\n"
-    'Set "csam": false for any sexual content involving adults (18+, including '
-    '"just turned 18," college-aged, or adult characters). If there is no clear '
-    "indication the subject is a minor, default to false — assume adult on this "
-    "18+ platform.\n\n"
+    'You are a strict child-safety classifier for an adults-only (18+) fictional '
+    "roleplay platform. Adult sexual content between adults is ALLOWED and must "
+    "NOT be flagged. Your ONLY task is to detect child sexual abuse material "
+    "(CSAM): content that sexualizes, or places in a sexual or suggestive "
+    "context, anyone who is or appears to be a minor (under 18).\n\n"
     "Examine the user's message text and any images. Reply with ONLY compact "
-    'JSON: {"csam": <true|false>, "reason": "<short reason>"}. No other text.'
+    'JSON: {"csam": <true|false>, "reason": "<short reason>"}.\n\n'
+    'Set "csam": true when sexual or suggestive content involves a subject who '
+    "is or could be under 18 — signals include a stated age under 18, school "
+    'grade or "student"/"schoolgirl" framing, words like child, kid, little, '
+    "young, preteen, loli, or shota, or a childlike/underage depiction combined "
+    "with any sexual or suggestive content. When a sexualized subject's age is "
+    'genuinely ambiguous, set "csam": true.\n\n'
+    'Set "csam": false for sexual content that clearly involves only adults, and '
+    "for any non-sexual content. Output JSON only, no other text."
 )
-# A provider safety-refusal is only a block when it SPECIFICALLY names CSAM /
-# minors. On this 18+ platform the classifier routinely refuses legitimate
-# explicit adult content with generic "I cannot assist" / "against policy"
-# language — those generic refusals are NOT CSAM signal and must fail open.
 _CSAM_REFUSAL_RE = re.compile(
-    r"\bcsam\b|child sexual (?:abuse|exploitation|assault)|child (?:abuse|porn)"
-    r"|sexual(?:ization|ised|izing)? of (?:a )?(?:minor|child|underage)"
-    r"|underage (?:sexual|minor|girl|boy)|prepubescent|\bloli\b|\bshota\b",
+    r"\bcsam\b|child (?:sexual|abuse|porn)|minor|cannot (?:assist|comply|process|help)"
+    r"|won'?t (?:assist|help)|not able to|unable to|against (?:my|our) (?:policy|guidelines)",
     re.IGNORECASE,
 )
 _CSAM_JSON_RE = re.compile(r'"csam"\s*:\s*(true|false)', re.IGNORECASE)
@@ -125,15 +122,7 @@ def attestation_document(nonce: bytes, public_key_der: bytes) -> bytes:
         out = ctypes.create_string_buffer(ATT_DOC_MAX)
         out_len = ctypes.c_uint32(ATT_DOC_MAX)
         rc = _nsm.nsm_get_attestation_doc(
-            fd,
-            None,
-            0,
-            nonce,
-            len(nonce),
-            public_key_der,
-            len(public_key_der),
-            out,
-            ctypes.byref(out_len),
+            fd, None, 0, nonce, len(nonce), public_key_der, len(public_key_der), out, ctypes.byref(out_len),
         )
         if rc != 0:
             raise RuntimeError(f"nsm_get_attestation_doc rc={rc}")
@@ -160,20 +149,12 @@ def kms_decrypt(
     if not creds.get("access_key_id"):
         raise RuntimeError("aws_creds missing — the parent must inject them")
     args = [
-        "/usr/bin/kmstool_enclave_cli",
-        "decrypt",
-        "--region",
-        KMS_REGION,
-        "--proxy-port",
-        str(KMS_VSOCK_PORT),
-        "--aws-access-key-id",
-        creds["access_key_id"],
-        "--aws-secret-access-key",
-        creds["secret_access_key"],
-        "--aws-session-token",
-        creds.get("session_token", ""),
-        "--ciphertext",
-        ciphertext_b64,
+        "/usr/bin/kmstool_enclave_cli", "decrypt", "--region", KMS_REGION,
+        "--proxy-port", str(KMS_VSOCK_PORT),
+        "--aws-access-key-id", creds["access_key_id"],
+        "--aws-secret-access-key", creds["secret_access_key"],
+        "--aws-session-token", creds.get("session_token", ""),
+        "--ciphertext", ciphertext_b64,
     ]
     if encryption_context:
         args.extend(["--encryption-context", json.dumps(encryption_context)])
@@ -218,6 +199,47 @@ def deepinfra_key(creds: dict, ciphertext: str = "") -> str:
     return _deepinfra_key
 
 
+# ---- PromptPack: the assembler's prompt content, unwrapped attestation-gated ----
+# The bun-compiled assembler ships with NO proprietary strings (so PCR0 is
+# reproducible from the public source). The content rides in as a KMS-wrapped JSON
+# blob the forwarder injects into assembler ops; we unwrap it here and feed it to
+# the assembler on stdin. Unwrapped once and cached for the process lifetime, like
+# the provider key.
+_prompt_pack: dict | None = None
+_pp_source: dict = {"creds": None, "ciphertext": ""}
+
+
+def set_prompt_pack_source(creds: dict, ciphertext: str) -> None:
+    """Record where to KMS-unwrap the PromptPack from for THIS request (called once
+    per request in main()). The unwrap itself is LAZY — only assembler ops trigger
+    it — so non-assembling ops (reseal_history / content_encrypt / unwrap_dek) keep
+    working even when no pack ciphertext is injected."""
+    global _pp_source
+    _pp_source = {"creds": creds or {}, "ciphertext": ciphertext or ""}
+
+
+def active_prompt_pack() -> dict:
+    """The unwrapped PromptPack fed to the assembler. The pack (~40 KB JSON) far
+    exceeds KMS's 4 KB direct-encrypt limit, so it is delivered ENVELOPE-encrypted:
+    a base64 JSON {"wrapped": <KMS ciphertext of a 256-bit data key>, "ct": <base64
+    iv(12) || AES-256-GCM(ct||tag)>}. We KMS-unwrap the data key (attestation-gated
+    to this PCR0 — the host's creds are useless anywhere else) and AES-open the pack.
+    Cached after the first unwrap. Raises when nothing was injected — FAIL CLOSED:
+    the binary has no built-in content, so a missing pack must error, never assemble
+    a blank/identity-free prompt."""
+    global _prompt_pack
+    if _prompt_pack is None:
+        raw = _pp_source["ciphertext"] or PROMPTPACK_CIPHERTEXT_B64
+        if not raw:
+            raise RuntimeError("promptpack unavailable: no ciphertext injected")
+        env = json.loads(base64.b64decode(raw))
+        key = kms_decrypt(_pp_source["creds"], env["wrapped"])
+        blob = base64.b64decode(env["ct"])
+        pack_json = AESGCM(key).decrypt(blob[:12], blob[12:], None).decode("utf-8")
+        _prompt_pack = json.loads(pack_json)
+    return _prompt_pack
+
+
 def _deepinfra_post(api_key: str, body: bytes) -> bytes:
     """POST to DeepInfra over its OWN vsock tunnel (port 8003 → api.deepinfra.com);
     return the full raw HTTP response. Bounded by a socket timeout so the screen
@@ -257,24 +279,20 @@ def csam_blocks(creds: dict, di_ciphertext: str, text: str) -> bool:
         return False
     try:
         key = deepinfra_key(creds, di_ciphertext)
-        body = json.dumps(
-            {
-                "model": DEEPINFRA_MODEL,
-                "temperature": 0,
-                "max_tokens": 80,
-                "messages": [
-                    {"role": "system", "content": CSAM_PROMPT},
-                    {"role": "user", "content": text[:12000]},
-                ],
-            }
-        ).encode()
+        body = json.dumps({
+            "model": DEEPINFRA_MODEL,
+            "temperature": 0,
+            "max_tokens": 80,
+            "messages": [
+                {"role": "system", "content": CSAM_PROMPT},
+                {"role": "user", "content": text[:12000]},
+            ],
+        }).encode()
         raw = _deepinfra_post(key, body)
         content = _http_body(raw).decode("utf-8", "replace")
         try:
             j = json.loads(content)
-            content = (j.get("choices") or [{}])[0].get("message", {}).get(
-                "content"
-            ) or ""
+            content = (j.get("choices") or [{}])[0].get("message", {}).get("content") or ""
         except Exception:
             pass
         m = _CSAM_JSON_RE.search(content)
@@ -317,8 +335,12 @@ ASSEMBLER = "/usr/local/bin/inkwell-assemble"
 
 def assemble_messages(requests: list) -> list:
     """Run the bun-compiled assembler — same @erpocalypse/core/chat TypeScript the
-    API runs, producing a byte-identical prompt."""
-    payload = json.dumps({"requests": requests}).encode()
+    API runs, producing a byte-identical prompt. The PromptPack (proprietary prompt
+    content, KMS-unwrapped) rides in the stdin envelope; the binary carries none, so
+    a missing pack raises here (fail closed) rather than assembling blank."""
+    payload = json.dumps(
+        {"requests": requests, "promptPack": active_prompt_pack()}
+    ).encode()
     p = subprocess.run([ASSEMBLER], input=payload, capture_output=True)
     if p.returncode != 0:
         raise RuntimeError(
@@ -421,11 +443,7 @@ def content_encrypt(dek: bytes, plaintext: str, user_id: str) -> str:
     ct_tag = AESGCM(dek).encrypt(iv, plaintext.encode("utf-8"), user_id.encode())
     ct, tag = ct_tag[:-16], ct_tag[-16:]
     return CONTENT_TAG + ":".join(
-        [
-            base64.b64encode(iv).decode(),
-            base64.b64encode(tag).decode(),
-            base64.b64encode(ct).decode(),
-        ]
+        [base64.b64encode(iv).decode(), base64.b64encode(tag).decode(), base64.b64encode(ct).decode()]
     )
 
 
@@ -436,6 +454,25 @@ _EM_DASH_RE = re.compile(r"\s*—\s*")
 def strip_em_dash(text: str) -> str:
     """Replace em-dash (U+2014) + surrounding whitespace with ", ". Used in SSE parsing."""
     return _EM_DASH_RE.sub(", ", text)
+
+
+# Stray-CJK backstop (BAC-178/BAC-179): the platform model occasionally emits a
+# single Chinese character mid-English-prose. Strips Han ideographs (base block
+# + ext A) only when they stand ALONE, with CJK punctuation / fullwidth forms
+# counting as CJK context, so genuinely multilingual replies survive. Applied to
+# the ACCUMULATED reply before at-rest encryption, never per streamed delta (a
+# delta boundary can split a legitimate run); the web client applies the same
+# scrub to the live stream for display. Mirrors the API's scrubStrayCjk
+# (apps/api/src/chat/chat.service.ts) — keep the two regexes in sync.
+_STRAY_CJK_RE = re.compile(
+    "(^|[^㐀-鿿　-〿＀-￯])"
+    "[㐀-鿿]"
+    "(?![㐀-鿿　-〿＀-￯])"
+)
+
+
+def scrub_stray_cjk(text: str) -> str:
+    return _STRAY_CJK_RE.sub(r"\1", text)
 
 
 # ---- provider call helpers (sealed reply path) ------------------------------
@@ -539,18 +576,12 @@ def turn_cost_micros(usage: dict | None) -> int:
 
 # ---- operator-blind streaming reply -----------------------------------------
 def stream_sealed_reply(
-    conn,
-    sealer: "ClientSealer",
-    api_key: str,
-    body: bytes,
-    score_req: dict | None,
-    dek: bytes | None,
-    user_id: str | None,
-    user_msg_pt: str | None = None,
-    user_msg_kind: str | None = None,
+    conn, sealer: "ClientSealer", api_key: str, body: bytes,
+    score_req: dict | None, dek: bytes | None, user_id: str | None,
+    user_msg_pt: str | None = None, user_msg_kind: str | None = None,
     fold_job: dict | None = None,
-    aws_creds: dict | None = None,
-    di_ciphertext: str = "",
+    aws_creds: dict | None = None, di_ciphertext: str = "",
+    steer_text_pt: str | None = None,
 ) -> None:
     """SSE reply path: parse provider stream in-enclave, seal each delta to the
     client session key as {"e": {"t": delta}}. At stream end, run scoring in-
@@ -569,13 +600,11 @@ def stream_sealed_reply(
     mod: dict = {"v": None}
     mod_thread = None
     if DEEPINFRA_HOST and user_msg_pt and user_msg_pt.strip():
-
         def _screen() -> None:
             try:
                 mod["v"] = csam_blocks(aws_creds or {}, di_ciphertext, user_msg_pt)
             except Exception:
                 mod["v"] = False
-
         mod_thread = threading.Thread(target=_screen, daemon=True)
         mod_thread.start()
     else:
@@ -701,8 +730,7 @@ def stream_sealed_reply(
                 [{**score_req, "op": "score_build", "reply": full_reply}]
             )[0]
             content = provider_json_content(
-                api_key,
-                {
+                api_key, {
                     "model": score_req["model"],
                     "messages": built["messages"],
                     "stream": False,
@@ -713,14 +741,7 @@ def stream_sealed_reply(
                 },
             )
             parsed = run_assembler(
-                [
-                    {
-                        **score_req,
-                        "op": "score_parse",
-                        "reply": full_reply,
-                        "content": content,
-                    }
-                ]
+                [{**score_req, "op": "score_parse", "reply": full_reply, "content": content}]
             )[0]
             if parsed is not None:
                 state = parsed
@@ -760,6 +781,15 @@ def stream_sealed_reply(
             "text": content_encrypt(dek, user_msg_pt, user_id),
             "kind": user_msg_kind,
         }
+    # SYS-23: DEK-encrypt the typed steer nudge so the per-variant swipe LABEL
+    # survives a reload on this operator-blind thread (the API stores it on the new
+    # variant's steer.text; reseal_history decrypts it back). The plaintext stays
+    # in-enclave; only ciphertext crosses to the API.
+    if dek is not None and user_id is not None and steer_text_pt:
+        meta["steer_text_ciphertext"] = content_encrypt(dek, steer_text_pt, user_id)
+    # Stray-CJK backstop on the accumulated reply before it persists at rest
+    # (the API can't rewrite this thread's ciphertext later).
+    full_reply = scrub_stray_cjk(full_reply)
     if dek is not None and user_id is not None and full_reply.strip():
         ct: dict = {"reply": content_encrypt(dek, full_reply, user_id)}
         if state is not None:
@@ -793,6 +823,22 @@ def _decrypt_turns(dek: bytes, turns: list, user_id: str) -> list:
     return out
 
 
+def _reseal_steer(dek: bytes, steer, user_id: str) -> dict | None:
+    """Decrypt one stored variant `steer` blob for reseal (SYS-23): `chip` is a
+    clear enum, `text` (the typed nudge) is DEK-ciphertext. Returns {chip?, text?}
+    or None for an empty/blind-reroll slot, so the client re-labels each swipe."""
+    if not isinstance(steer, dict):
+        return None
+    out: dict = {}
+    chip = steer.get("chip")
+    if chip:
+        out["chip"] = chip
+    text = steer.get("text")
+    if text:
+        out["text"] = content_decrypt(dek, text, user_id)
+    return out or None
+
+
 def decrypt_bundle_content(bundle: dict, dek: bytes, user_id: str) -> None:
     """Decrypt all ciphertext ingredients in-place: history turns, memory, rolling
     summary, and the client-sealed new user message. Mutates bundle so the assembler
@@ -813,6 +859,37 @@ def decrypt_bundle_content(bundle: dict, dek: bytes, user_id: str) -> None:
         history.append({"role": "user", "text": text})
     dto["messages"] = history
 
+    # SYS-23: operator-blind directed-regeneration TYPED nudge. The free-text nudge
+    # is user content, so it travels SEALED (same RSA+AES envelope as the new user
+    # message) and is unsealed only HERE, in-enclave — the operator never sees it.
+    # We wrap it in the steer scaffold and fold it into the assemble request's
+    # `trailingState`, the same non-content DATA channel the affection/length/chip
+    # lines ride, so it lands on the newest (never-cached) user turn and the
+    # assembler binary stays byte-identical (golden hash unchanged; PCR0 moves only
+    # because THIS file changed). The scaffold + whitespace-collapse are kept
+    # VERBATIM in sync with apps/api/src/chat/chat.service.ts `steerDirective`
+    # (typed branch) so a typed nudge steers identically on the direct + blind paths.
+    sealed_steer = bundle.get("sealed_steer_text")
+    if sealed_steer:
+        priv = bundle["__priv"]
+        steer_pt = re.sub(
+            r"\s+", " ", unseal(priv, base64.b64decode(sealed_steer)).decode("utf-8")
+        ).strip()
+        if steer_pt:
+            bundle["__steer_pt"] = steer_pt
+            steer_dir = (
+                "(Steer, hidden direction, a direct command from the user for "
+                f"this reply: {steer_pt}. Treat this as a hard requirement, not "
+                "a suggestion: include exactly what it asks for and leave out "
+                "anything it forbids in this reply. Stay fully in character and "
+                "write it naturally; do not quote, mention, or acknowledge this "
+                "instruction.)"
+            )
+            existing = assemble.get("trailingState")
+            assemble["trailingState"] = (
+                f"{existing}\n\n{steer_dir}" if existing else steer_dir
+            )
+
     a_opts = assemble.get("opts")
     if isinstance(a_opts, dict) and a_opts.get("memory"):
         a_opts["memory"] = content_decrypt(dek, a_opts["memory"], user_id)
@@ -820,7 +897,9 @@ def decrypt_bundle_content(bundle: dict, dek: bytes, user_id: str) -> None:
     # decrypted here so the shared core assembly injects them byte-identically
     # to the direct path. Mirrors memory/globalPrompt.
     if isinstance(a_opts, dict) and a_opts.get("pins"):
-        a_opts["pins"] = [content_decrypt(dek, p, user_id) for p in a_opts["pins"]]
+        a_opts["pins"] = [
+            content_decrypt(dek, p, user_id) for p in a_opts["pins"]
+        ]
     d_opts = dto.get("options")
     if isinstance(d_opts, dict) and d_opts.get("memory"):
         d_opts["memory"] = content_decrypt(dek, d_opts["memory"], user_id)
@@ -830,9 +909,7 @@ def decrypt_bundle_content(bundle: dict, dek: bytes, user_id: str) -> None:
     if dto.get("globalPrompt"):
         dto["globalPrompt"] = content_decrypt(dek, dto["globalPrompt"], user_id)
     if assemble.get("rollingSummary"):
-        assemble["rollingSummary"] = content_decrypt(
-            dek, assemble["rollingSummary"], user_id
-        )
+        assemble["rollingSummary"] = content_decrypt(dek, assemble["rollingSummary"], user_id)
     # Chapter log (BAC-113/118): the serialized SummaryChapter[] behind the
     # rolling summary, decrypted for the chapter_build/chapter_apply ops. The
     # prompt itself only ever sees the joined rollingSummary above.
@@ -887,24 +964,17 @@ def run_lore_matching(bundle: dict) -> dict | None:
     assemble = bundle.get("assemble") or {}
     dto = assemble.get("dto") or {}
     try:
-        result = run_assembler(
-            [
-                {
-                    "op": "lore_match",
-                    "scene": {
-                        "id": bundle.get("conversation_id", ""),
-                        "messages": dto.get("messages", []),
-                    },
-                    "character": bundle.get("lore_character", {}),
-                    "persona": bundle.get("lore_persona", {}),
-                    "lorebooks": lorebooks,
-                    "attachments": attachments,
-                    "prevState": bundle.get("lore_prev_state") or {},
-                    "budgetTokens": bundle.get("lore_budget_tokens", 1024),
-                    "triggerType": bundle.get("lore_trigger_type", "normal"),
-                }
-            ]
-        )[0]
+        result = run_assembler([{
+            "op": "lore_match",
+            "scene": {"id": bundle.get("conversation_id", ""), "messages": dto.get("messages", [])},
+            "character": bundle.get("lore_character", {}),
+            "persona": bundle.get("lore_persona", {}),
+            "lorebooks": lorebooks,
+            "attachments": attachments,
+            "prevState": bundle.get("lore_prev_state") or {},
+            "budgetTokens": bundle.get("lore_budget_tokens", 1024),
+            "triggerType": bundle.get("lore_trigger_type", "normal"),
+        }])[0]
         if not result or not isinstance(result, dict):
             return None
         return slots_to_lore_injection(result.get("slots") or [])
@@ -959,17 +1029,14 @@ def extract_fold_job(bundle: dict) -> dict | None:
 def _fold_provider_call(api_key: str, job: dict, built: dict):
     """One non-streaming platform call for a fold-pipeline request (chapter,
     roll-up, fact rescue): returns (content, cost_micros) or (None, 0)."""
-    j = provider_json_response(
-        api_key,
-        {
-            "model": job["model"],
-            "messages": built["messages"],
-            "stream": False,
-            **job.get("reasoning", {}),
-            "temperature": built["temperature"],
-            "max_tokens": built["maxTokens"],
-        },
-    )
+    j = provider_json_response(api_key, {
+        "model": job["model"],
+        "messages": built["messages"],
+        "stream": False,
+        **job.get("reasoning", {}),
+        "temperature": built["temperature"],
+        "max_tokens": built["maxTokens"],
+    })
     if not isinstance(j, dict):
         return None, 0
     content = j.get("choices", [{}])[0].get("message", {}).get("content")
@@ -1046,25 +1113,21 @@ def run_fact_rescue(
         return None
     try:
         max_chars = int(facts["max_chars"])
-        built = run_assembler(
-            [
-                {
-                    "op": "facts_build",
-                    "currentMemory": current_memory,
-                    "dropped": job["dropped"],
-                    "name": job["name"],
-                    "maxChars": max_chars,
-                }
-            ]
-        )[0]
+        built = run_assembler([{
+            "op": "facts_build",
+            "currentMemory": current_memory,
+            "dropped": job["dropped"],
+            "name": job["name"],
+            "maxChars": max_chars,
+        }])[0]
         if not isinstance(built, dict):
             return None
         content, cost = _fold_provider_call(api_key, job, built)
         if content is None:
             return None
-        applied = run_assembler(
-            [{"op": "facts_apply", "out": content, "maxChars": max_chars}]
-        )[0]
+        applied = run_assembler([
+            {"op": "facts_apply", "out": content, "maxChars": max_chars}
+        ])[0]
         if not isinstance(applied, str) or not applied.strip():
             return None
         return {
@@ -1076,9 +1139,7 @@ def run_fact_rescue(
 
 
 # ---- command dispatch -------------------------------------------------------
-def handle_chat_body(
-    conn, priv, req: dict, opened: bytes, api_key: str, assemble: bool
-) -> None:
+def handle_chat_body(conn, priv, req: dict, opened: bytes, api_key: str, assemble: bool) -> None:
     """Dispatch a chat/assemble_chat to either legacy relay or sealed-reply path."""
     if assemble:
         bundle = json.loads(opened)
@@ -1141,18 +1202,14 @@ def handle_chat_body(
 
     sealer = ClientSealer(conn, base64.b64decode(client_pubkey))
     stream_sealed_reply(
-        conn,
-        sealer,
-        api_key,
-        json.dumps(body).encode(),
-        score,
-        dek,
-        user_id,
-        user_msg_pt,
-        user_msg_kind,
+        conn, sealer, api_key, json.dumps(body).encode(), score, dek, user_id,
+        user_msg_pt, user_msg_kind,
         bundle.get("__fold_job") if assemble else None,
         aws_creds=req.get("aws_creds") or {},
         di_ciphertext=req.get("deepinfra_key_ciphertext", ""),
+        # SYS-23: the unsealed typed nudge (set by decrypt_bundle_content), so the
+        # reply meta can DEK-encrypt it onto the new swipe variant.
+        steer_text_pt=bundle.get("__steer_pt") if assemble else None,
     )
 
 
@@ -1166,11 +1223,7 @@ def assemble_and_reseal(conn, priv, req: dict) -> None:
     client_pubkey = bundle["client_pubkey"]
     wrapped_dek = bundle["wrapped_dek"]
     user_id = bundle.get("user_id")
-    dek = kms_decrypt(
-        req.get("aws_creds") or {},
-        wrapped_dek,
-        {"userId": user_id} if user_id else None,
-    )
+    dek = kms_decrypt(req.get("aws_creds") or {}, wrapped_dek, {"userId": user_id} if user_id else None)
     bundle["__priv"] = priv
     decrypt_bundle_content(bundle, dek, user_id)
     fold_job = extract_fold_job(bundle)
@@ -1198,9 +1251,7 @@ def assemble_and_reseal(conn, priv, req: dict) -> None:
             # assemble time, so the pre-turn recollection is the base; the later
             # /byok-turn scoring reloads the rescued note and merges on top.
             facts_out = (
-                run_fact_rescue(
-                    key, dek, user_id, fold_job, fold_job.get("prev_memory")
-                )
+                run_fact_rescue(key, dek, user_id, fold_job, fold_job.get("prev_memory"))
                 if fold_out is not None
                 else None
             )
@@ -1209,9 +1260,7 @@ def assemble_and_reseal(conn, priv, req: dict) -> None:
             facts_out = None
         if fold_out:
             meta["summary_ciphertext"] = fold_out["summary_ciphertext"]
-            meta["summary_chapters_ciphertext"] = fold_out[
-                "summary_chapters_ciphertext"
-            ]
+            meta["summary_chapters_ciphertext"] = fold_out["summary_chapters_ciphertext"]
             meta["summarized_upto"] = fold_out["summarized_upto"]
         if facts_out:
             meta["memory_ciphertext"] = facts_out["memory_ciphertext"]
@@ -1235,6 +1284,11 @@ def main() -> None:
         try:
             req = recv_frame(conn)
             op = req.get("op")
+            # Where to KMS-unwrap the PromptPack for this request (lazy — only the
+            # assembler ops actually unwrap it; injected by the forwarder for those).
+            set_prompt_pack_source(
+                req.get("aws_creds") or {}, req.get("promptpack_ciphertext", "")
+            )
             if op == "ping":
                 send_frame(conn, {"ok": True})
             elif op == "attest":
@@ -1243,30 +1297,20 @@ def main() -> None:
                 send_frame(conn, {"doc": base64.b64encode(doc).decode()})
             elif op == "chat":
                 opened = unseal(priv, base64.b64decode(req["sealed"]))
-                key = provider_key(
-                    req.get("aws_creds") or {}, req.get("provider_key_ciphertext", "")
-                )
+                key = provider_key(req.get("aws_creds") or {}, req.get("provider_key_ciphertext", ""))
                 handle_chat_body(conn, priv, req, opened, key, assemble=False)
             elif op == "assemble_chat":
                 opened = unseal(priv, base64.b64decode(req["sealed"]))
-                key = provider_key(
-                    req.get("aws_creds") or {}, req.get("provider_key_ciphertext", "")
-                )
+                key = provider_key(req.get("aws_creds") or {}, req.get("provider_key_ciphertext", ""))
                 handle_chat_body(conn, priv, req, opened, key, assemble=True)
             elif op == "reseal_history":
                 bundle = json.loads(unseal(priv, base64.b64decode(req["sealed"])))
                 user_id = bundle["user_id"]
-                dek = kms_decrypt(
-                    req.get("aws_creds") or {},
-                    bundle["wrapped_dek"],
-                    {"userId": user_id},
-                )
+                dek = kms_decrypt(req.get("aws_creds") or {}, bundle["wrapped_dek"], {"userId": user_id})
                 sealer = ClientSealer(conn, base64.b64decode(bundle["client_pubkey"]))
                 for m in bundle.get("messages", []):
                     out = {
-                        "role": m.get("role"),
-                        "kind": m.get("kind"),
-                        "id": m.get("id"),
+                        "role": m.get("role"), "kind": m.get("kind"), "id": m.get("id"),
                         "createdAt": m.get("createdAt"),
                         "text": content_decrypt(dek, m["text"], user_id),
                     }
@@ -1279,26 +1323,26 @@ def main() -> None:
                             content_decrypt(dek, v, user_id) for v in variants
                         ]
                         out["activeVariant"] = m.get("activeVariant")
+                        # Per-variant steer labels (SYS-23): decrypt each typed
+                        # nudge's text so the swipe labels rehydrate on reload; chip
+                        # rides clear. Parallel to `variants`; null for blind rerolls.
+                        variant_steers = m.get("variantSteers")
+                        if variant_steers:
+                            out["variantSteers"] = [
+                                _reseal_steer(dek, s, user_id) for s in variant_steers
+                            ]
                     sealer.emit(out)
                 send_frame(conn, {"done": True})
             elif op == "content_encrypt":
                 bundle = json.loads(unseal(priv, base64.b64decode(req["sealed"])))
                 user_id = bundle["user_id"]
-                dek = kms_decrypt(
-                    req.get("aws_creds") or {},
-                    bundle["wrapped_dek"],
-                    {"userId": user_id},
-                )
+                dek = kms_decrypt(req.get("aws_creds") or {}, bundle["wrapped_dek"], {"userId": user_id})
                 cts = [content_encrypt(dek, v, user_id) for v in bundle["values"]]
                 send_frame(conn, {"values": cts})
             elif op == "content_encrypt_sealed":
                 outer = json.loads(unseal(priv, base64.b64decode(req["sealed"])))
                 user_id = outer["user_id"]
-                dek = kms_decrypt(
-                    req.get("aws_creds") or {},
-                    outer["wrapped_dek"],
-                    {"userId": user_id},
-                )
+                dek = kms_decrypt(req.get("aws_creds") or {}, outer["wrapped_dek"], {"userId": user_id})
                 cts = []
                 for sv in outer["sealed_values"]:
                     pt = unseal(priv, base64.b64decode(sv)).decode("utf-8")
@@ -1307,11 +1351,7 @@ def main() -> None:
             elif op == "score_sealed":
                 outer = json.loads(unseal(priv, base64.b64decode(req["sealed"])))
                 user_id = outer["user_id"]
-                dek = kms_decrypt(
-                    req.get("aws_creds") or {},
-                    outer["wrapped_dek"],
-                    {"userId": user_id},
-                )
+                dek = kms_decrypt(req.get("aws_creds") or {}, outer["wrapped_dek"], {"userId": user_id})
                 score = outer.get("score") or {}
                 sdto = score.get("dto") or {}
                 if sdto.get("messages"):
@@ -1321,37 +1361,21 @@ def main() -> None:
                         mem = opts.get("memory")
                         if mem:
                             opts["memory"] = content_decrypt(dek, mem, user_id)
-                key = provider_key(
-                    req.get("aws_creds") or {}, req.get("provider_key_ciphertext", "")
-                )
+                key = provider_key(req.get("aws_creds") or {}, req.get("provider_key_ciphertext", ""))
                 sealed_reply_b64 = outer.get("sealed_reply", "")
                 reply = unseal(priv, base64.b64decode(sealed_reply_b64)).decode("utf-8")
                 try:
-                    built = run_assembler(
-                        [{**score, "op": "score_build", "reply": reply}]
-                    )[0]
-                    content = provider_json_content(
-                        key,
-                        {
-                            "model": score.get("model"),
-                            "messages": built["messages"],
-                            "stream": False,
-                            **score.get("reasoning", {}),
-                            "response_format": {"type": "json_object"},
-                            "temperature": 0.6,
-                            "max_tokens": built["maxTokens"],
-                        },
-                    )
-                    parsed = run_assembler(
-                        [
-                            {
-                                **score,
-                                "op": "score_parse",
-                                "reply": reply,
-                                "content": content,
-                            }
-                        ]
-                    )[0]
+                    built = run_assembler([{**score, "op": "score_build", "reply": reply}])[0]
+                    content = provider_json_content(key, {
+                        "model": score.get("model"),
+                        "messages": built["messages"],
+                        "stream": False,
+                        **score.get("reasoning", {}),
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0.6,
+                        "max_tokens": built["maxTokens"],
+                    })
+                    parsed = run_assembler([{**score, "op": "score_parse", "reply": reply, "content": content}])[0]
                 except Exception:
                     parsed = None
                 love_delta = 0
@@ -1365,9 +1389,7 @@ def main() -> None:
                         state_out["memory"] = content_encrypt(dek, mem, user_id)
                     acts = parsed.get("actions") or []
                     if len(acts):
-                        state_out["actions"] = [
-                            content_encrypt(dek, a, user_id) for a in acts
-                        ]
+                        state_out["actions"] = [content_encrypt(dek, a, user_id) for a in acts]
                 send_frame(conn, {"state": state_out})
             elif op == "assemble_reseal":
                 assemble_and_reseal(conn, priv, req)
@@ -1378,9 +1400,7 @@ def main() -> None:
                 send_frame(conn, {"error": "bad_op"})
         except Exception as exc:
             try:
-                send_frame(
-                    conn, {"error": type(exc).__name__, "detail": str(exc)[:220]}
-                )
+                send_frame(conn, {"error": type(exc).__name__, "detail": str(exc)[:220]})
             except Exception:
                 pass
         finally:
