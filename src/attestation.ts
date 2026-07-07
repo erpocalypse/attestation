@@ -26,11 +26,11 @@ const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
 // bump these WITH measurements.json and re-publish the attestation mirror BEFORE
 // flipping the fleet, or every client's check fails.
 const EXPECTED_PCR0 =
-  "580ffb7e88be73592a410cf83e6d73bbd1b997a632703bf270427a00a5b36404ecf8f5591d76f5dfef4c2887160ef310";
+  "4967bd57a4e013c2b702b7d23c12e6b61d1435fc7319940b39857d26262a0fc3c2a97fe2d2a0766a3f1404eb345e5e9b";
 const EXPECTED_PCR1 =
   "3b4a7e1b5f13c5a1000b3ed32ef8995ee13e9876329f9bc72650b918329ef9cf4e2e4d1e1e37375dab0ba56ba0974d03";
 const EXPECTED_PCR2 =
-  "ba599595f4079fa33c225fa4da813ef6a2c09208dcf48da67f72c266f24fadfe5b8062ea139b38997566fac8070ef99a";
+  "0e416aaf9e7b8f249227197159a2b9d276b783c91a5a07210517429ab9cdb6aebc3b19f34ac2d58d659a23caca789e74";
 
 export interface Check {
   ok: boolean;
