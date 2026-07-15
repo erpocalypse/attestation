@@ -4,6 +4,7 @@
 export * from "./types";
 export * from "./difficulty";
 export * from "./assembly";
+export * from "./macros";
 export * from "./dispatch";
 export * from "./scoring";
 export * from "./summarize";

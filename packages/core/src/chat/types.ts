@@ -47,6 +47,10 @@ export interface ChatContext {
     scenario?: string;
     /** Example messages that steer the voice (SillyTavern `mes_example`). */
     exampleDialogue?: string;
+    /** Server-distilled one-paragraph description of HOW the character speaks,
+     *  derived from `exampleDialogue` at save time (BAC-195). Injected as a
+     *  compact "Voice" header line; never author-editable. */
+    voiceProfile?: string;
     /** Author-written standing instructions injected into the `system` message
      *  (per-character header, after Scenario) — not lorebook context. */
     systemPrompt?: string;
@@ -73,10 +77,10 @@ export interface ChatContext {
 /** World (narrator) chat context, assembled server-side. */
 export interface WorldContext {
   /** `sharedCanon` true = the one pre-seeded world that lives in the shared
-   *  "Verge" bible: the narrator gets WORLD_LORE + the "region of the world above"
-   *  framing. Every other world (default) runs purely on its own `setting`. Plain
-   *  metadata (not a secret), shipped into the enclave as data — the assembly LOGIC
-   *  change is what bumps PCR0, not this value (BAC-143). */
+   *  "Verge" bible: the narrator gets WORLD_LORE + the "region of the world
+   *  above" framing. Every other world (default) runs purely on its own
+   *  `setting`. Plain metadata (not a secret), shipped into the enclave as data
+   *  — the assembly LOGIC change is what bumps PCR0, not this value (BAC-143). */
   world: { name: string; setting?: string; nsfw?: boolean; sharedCanon?: boolean };
   cast: {
     name: string;
@@ -84,6 +88,8 @@ export interface WorldContext {
     description?: string;
     scenario?: string;
     exampleDialogue?: string;
+    /** See {@link ChatContext.character.voiceProfile}. */
+    voiceProfile?: string;
   }[];
   persona?: { name?: string; description?: string } | null;
   /** See {@link ChatContext.globalPrompt}. Applied to world (narrator) chats too. */

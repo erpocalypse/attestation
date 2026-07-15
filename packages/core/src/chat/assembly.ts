@@ -7,6 +7,7 @@
 import type { ContextSlot } from "../lorebook";
 import { pack, fill } from "./promptpack/active";
 import { clampDifficulty } from "./difficulty";
+import { DEFAULT_USER_MACRO, substituteMacros } from "./macros";
 import {
   GIFT_MARKER,
   type ApiMessage,
@@ -121,6 +122,12 @@ export function systemPrompt(
     c.tagline && `Premise: ${c.tagline}`,
     c.description && `Background: ${c.description}`,
     c.personality && `Personality: ${c.personality}`,
+    // Distilled voice profile (BAC-195): a compact, server-distilled description
+    // of HOW the character talks, derived from their example dialogue at save
+    // time. Sits with Personality so the delivery travels with the identity;
+    // the raw example turns additionally ride after the system message.
+    c.voiceProfile?.trim() &&
+      `Voice, how ${c.name} speaks: ${c.voiceProfile.trim()}`,
     c.scenario && `Scenario: ${c.scenario}`,
     // Author-written standing instructions for this character, injected straight
     // into the system message (NOT lorebook context). Placed last in the profile
@@ -215,10 +222,24 @@ export function systemPrompt(
     );
   }
 
+  // Voice anchor (BAC-195): a recency-anchored reminder, emitted only for
+  // characters with an established voice (example dialogue or a distilled
+  // profile), that the character's own voice outranks the house style. The
+  // examples themselves sit at the far top of the prompt where a long
+  // transcript drowns them; this line sits next to the generation point.
+  // Stable for the life of the character, so it never fragments the cache
+  // within a conversation; characters without a voice emit nothing and stay
+  // byte-identical.
+  if (c.exampleDialogue?.trim() || c.voiceProfile?.trim()) {
+    lines.push("", fill(pack().voiceCheck, { name: c.name }));
+  }
+
   // Recency anchor (name-free, constant): a terminal self-edit pass that
   // catches the AI tells prompting alone keeps leaking (em dashes, "not X,
   // not Y", stage-direction fragments, quip-question kickers), plus the format
-  // and the hard limits restated near the generation point.
+  // and the hard limits restated near the generation point. The style checklist
+  // explicitly yields to an established character voice (BAC-195) so it stops
+  // flattening characters with a distinctive way of speaking.
   lines.push("", pack().charFinalPass);
 
   // NOTE: tried collapsing computeState into this stream via inline JSON
@@ -287,14 +308,22 @@ export function worldSystemPrompt(
     w.setting && `SETTING for "${w.name}" specifically:\n${w.setting}`,
     "",
     // === PER-CONVERSATION (cast in scene + the user's persona) ===
+    // Each member's example dialogue is parsed into labelled sample lines
+    // (castExampleBlock) instead of dumping raw mes_example with <START>
+    // markers and unexpanded {{user}}/{{char}} braces (BAC-195). The distilled
+    // voiceProfile, when present, rides as a compact Voice sub-line.
     "CAST. You voice and control all of these characters as the scene needs:",
     ...dto.cast.map(
       (c) =>
         `- ${c.name}${c.personality ? `, ${c.personality}` : ""}${
           c.description ? ` (${c.description})` : ""
         }${c.scenario ? `\n  Scenario: ${c.scenario}` : ""}${
-          c.exampleDialogue ? `\n  Example dialogue: ${c.exampleDialogue}` : ""
-        }`,
+          c.voiceProfile?.trim() ? `\n  Voice: ${c.voiceProfile.trim()}` : ""
+        }${castExampleBlock(
+          c.exampleDialogue,
+          c.name,
+          dto.persona?.name?.trim() || "Player",
+        )}`,
     ),
     ...(lore?.afterProfile.length ? ["", ...lore.afterProfile] : []),
     "",
@@ -327,7 +356,8 @@ export function worldSystemPrompt(
     );
   }
   // Recency anchor: terminal self-edit pass against the AI tells (same as the
-  // single-character path), tuned for the narrator's named-speaker format.
+  // single-character path), tuned for the narrator's named-speaker format. The
+  // checklist yields to a cast member's established voice (BAC-195).
   lines.push("", pack().worldFinalPass);
   return lines.filter((l) => l !== undefined).join("\n");
 }
@@ -437,22 +467,18 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Parse SillyTavern-style example dialogue (`mes_example`) into example chat
+/** Parse SillyTavern-style example dialogue (`mes_example`) into raw speaker
  *  turns. Example blocks are separated by `<START>`; lines beginning with
- *  `{{user}}:`, `{{char}}:`, or `<charName>:` set the speaker, and unmarked lines
- *  continue the current turn. Returns a delimited example block (a system lead-in,
- *  the alternating turns, and a closing marker), or `[]` when there's nothing
- *  usable — so a character with no examples produces byte-identical output.
- *
- *  `substitute` rewrites `{{char}}`/`{{user}}` inside the turn CONTENT: the API
- *  passes its macro substituter; the enclave path leaves macros as-is, matching
- *  how the rest of core assembly treats them. Speaker markers are matched on the
- *  raw line BEFORE substitution. */
-export function exampleMessages(
+ *  `{{user}}:`, `{{char}}:`, or `<charName>:` set the speaker, and unmarked
+ *  lines continue the current turn. Speaker markers are matched on the raw line
+ *  BEFORE any macro substitution; `substitute` rewrites `{{char}}`/`{{user}}`
+ *  inside the turn CONTENT only. Shared by {@link exampleMessages} (single-
+ *  character few-shot turns) and {@link castExampleBlock} (world cast roster). */
+function parseExampleTurns(
   exampleDialogue: string | undefined,
   charName: string,
-  substitute: (s: string) => string = (s) => s,
-): ApiMessage[] {
+  substitute: (s: string) => string,
+): { role: "user" | "assistant"; content: string }[] {
   const text = exampleDialogue?.trim();
   if (!text) return [];
 
@@ -482,19 +508,59 @@ export function exampleMessages(
     }
   }
 
-  const cleaned = turns
+  return turns
     .map((t) => ({ role: t.role, content: substitute(t.content).trim() }))
     .filter((t) => t.content.length > 0);
+}
+
+/** Build the delimited example-turn block for a single-character chat (a system
+ *  lead-in that tells the model to IMITATE the voice, the alternating turns, and
+ *  a closing marker), or `[]` when there's nothing usable — so a character with
+ *  no examples produces byte-identical output.
+ *
+ *  `substitute` rewrites `{{char}}`/`{{user}}` inside the turn CONTENT: the API
+ *  passes its macro substituter; {@link composeCharMessages} builds the same
+ *  substituter from the dto for the enclave path (BAC-195 — previously the
+ *  enclave left macros raw and blind chats saw literal `{{user}}` braces). */
+export function exampleMessages(
+  exampleDialogue: string | undefined,
+  charName: string,
+  substitute: (s: string) => string = (s) => s,
+): ApiMessage[] {
+  const cleaned = parseExampleTurns(exampleDialogue, charName, substitute);
   if (!cleaned.length) return [];
 
   return [
     {
       role: "system",
-      content: `[Example dialogue — illustrates how ${charName} speaks. Samples only, not part of the actual conversation:]`,
+      content: `[Example dialogue — the authoritative samples of how ${charName} speaks. Study them and imitate this exact voice, diction, rhythm, and formatting in every reply. Samples only, not part of the actual conversation:]`,
     },
     ...cleaned,
     { role: "system", content: "[End of example dialogue.]" },
   ];
+}
+
+/** Render a cast member's example dialogue as indented, speaker-labelled sample
+ *  lines for the world (narrator) cast roster — replacing the old raw
+ *  `mes_example` dump that leaked `<START>` markers and `{{user}}`/`{{char}}`
+ *  braces into the prompt (BAC-195). Returns a block starting with its own
+ *  newline (so it appends directly to the roster bullet), or "" when there's
+ *  nothing usable. `playerName` labels the user's side of the samples and
+ *  substitutes `{{user}}` in the content. */
+export function castExampleBlock(
+  exampleDialogue: string | undefined,
+  castName: string,
+  playerName: string,
+): string {
+  const turns = parseExampleTurns(exampleDialogue, castName, (s) =>
+    substituteMacros(s, { user: playerName, char: castName }),
+  );
+  if (!turns.length) return "";
+  const lines = turns.map(
+    (t) =>
+      `    ${t.role === "user" ? playerName : castName}: ${t.content.replace(/\n/g, "\n    ")}`,
+  );
+  return `\n  Example dialogue, how ${castName} speaks (keep this exact voice):\n${lines.join("\n")}`;
 }
 
 export function composeCharMessages(a: ComposeCharArgs): ApiMessage[] {
@@ -511,8 +577,21 @@ export function composeCharMessages(a: ComposeCharArgs): ApiMessage[] {
     a.lore?.inline,
     a.rollingSummary,
   );
-  // Example chat turns ride in the cached prefix, right after the system message.
-  const examples = exampleMessages(a.dto.character.exampleDialogue, a.dto.character.name);
+  // Example chat turns ride in the cached prefix, right after the system
+  // message. Macros in the turn content are substituted from the dto exactly
+  // like the API's direct path (BAC-195): {{char}} → the character, {{user}} →
+  // the persona name or the shared default. NB: a {{user}} token in the
+  // examples keys the cached prefix per-persona — same accepted tradeoff as
+  // the direct path.
+  const examples = exampleMessages(
+    a.dto.character.exampleDialogue,
+    a.dto.character.name,
+    (s) =>
+      substituteMacros(s, {
+        user: a.dto.persona?.name?.trim() || DEFAULT_USER_MACRO,
+        char: a.dto.character.name,
+      }),
+  );
   if (examples.length) msgs.splice(1, 0, ...examples);
   return msgs;
 }

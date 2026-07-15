@@ -45,6 +45,10 @@ export interface PromptPack {
   charFinalPass: string;
   /** Terminal self-edit FINAL PASS for the World (narrator) path. */
   worldFinalPass: string;
+  /** Recency-anchored voice reminder, emitted just before the FINAL PASS for
+   *  characters with an established voice (example dialogue and/or a distilled
+   *  voice profile) — BAC-195. Token: {name}. */
+  voiceCheck: string;
   /** Premium relationship line. Tokens: {name}, {difficulty}, {difficultyGuidance}. */
   premiumRelationship: string;
   /** Premium intimacy line (tracks affection + difficulty). Token: {name}. */
