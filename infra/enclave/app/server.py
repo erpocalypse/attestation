@@ -22,6 +22,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import threading
 
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives import hashes, serialization
@@ -195,6 +196,38 @@ def kms_decrypt(
     return base64.b64decode(out.split("PLAINTEXT:", 1)[1].strip())
 
 
+def kms_genkey(creds: dict, key_id: str) -> tuple[bytes, str]:
+    """KMS GenerateDataKey inside the enclave via kmstool genkey (attestation-
+    gated exactly like decrypt: the key policy's PCR0 condition applies).
+    Returns (plaintext_key, wrapped_key_b64). The plaintext key exists ONLY in
+    enclave memory; the wrapped blob is opaque to the host/operator."""
+    if not creds.get("access_key_id"):
+        raise RuntimeError("aws_creds missing — the parent must inject them")
+    p = subprocess.run(
+        [
+            "/usr/bin/kmstool_enclave_cli", "genkey", "--region", KMS_REGION,
+            "--proxy-port", str(KMS_VSOCK_PORT),
+            "--aws-access-key-id", creds["access_key_id"],
+            "--aws-secret-access-key", creds["secret_access_key"],
+            "--aws-session-token", creds.get("session_token", ""),
+            "--key-id", key_id,
+            "--key-spec", "AES-256",
+        ],
+        capture_output=True,
+    )
+    if p.returncode != 0:
+        err = p.stderr.decode("utf-8", "replace")
+        lines = [ln for ln in err.splitlines() if ln.strip()]
+        raise RuntimeError(
+            "kmstool genkey rc=%d: %s" % (p.returncode, " || ".join(lines[-3:])[:260])
+        )
+    out = p.stdout.decode()
+    wrapped_b64 = out.split("CIPHERTEXT:", 1)[1].splitlines()[0].strip()
+    plaintext = base64.b64decode(out.split("PLAINTEXT:", 1)[1].strip())
+    return plaintext, wrapped_b64
+
+
+_key_lock = threading.Lock()
 _provider_key: str | None = None
 
 
@@ -202,10 +235,12 @@ def provider_key(creds: dict, ciphertext: str = "") -> str:
     """Lazy-fetch the provider API key via attestation-gated KMS unwrap."""
     global _provider_key
     if _provider_key is None:
-        ct = ciphertext or PROVIDER_KEY_CIPHERTEXT_B64
-        if not ct:
-            raise RuntimeError("no provider-key ciphertext")
-        _provider_key = kms_decrypt(creds, ct).decode("utf-8").strip()
+        with _key_lock:
+            if _provider_key is None:
+                ct = ciphertext or PROVIDER_KEY_CIPHERTEXT_B64
+                if not ct:
+                    raise RuntimeError("no provider-key ciphertext")
+                _provider_key = kms_decrypt(creds, ct).decode("utf-8").strip()
     return _provider_key
 
 
@@ -218,10 +253,12 @@ def deepinfra_key(creds: dict, ciphertext: str = "") -> str:
     this attested PCR0."""
     global _deepinfra_key
     if _deepinfra_key is None:
-        ct = ciphertext or DEEPINFRA_KEY_CIPHERTEXT_B64
-        if not ct:
-            raise RuntimeError("no deepinfra-key ciphertext")
-        _deepinfra_key = kms_decrypt(creds, ct).decode("utf-8").strip()
+        with _key_lock:
+            if _deepinfra_key is None:
+                ct = ciphertext or DEEPINFRA_KEY_CIPHERTEXT_B64
+                if not ct:
+                    raise RuntimeError("no deepinfra-key ciphertext")
+                _deepinfra_key = kms_decrypt(creds, ct).decode("utf-8").strip()
     return _deepinfra_key
 
 
@@ -232,16 +269,21 @@ def deepinfra_key(creds: dict, ciphertext: str = "") -> str:
 # the assembler on stdin. Unwrapped once and cached for the process lifetime, like
 # the provider key.
 _prompt_pack: dict | None = None
-_pp_source: dict = {"creds": None, "ciphertext": ""}
+_pp_lock = threading.Lock()
+# Per-REQUEST unwrap source. SYS-39 made the dispatch loop concurrent, so this
+# must be thread-local: a module-level global raced — a non-assembler frame
+# (empty ciphertext) could overwrite an assembler frame's source between its
+# dispatch and its lazy unwrap.
+_pp_local = threading.local()
 
 
 def set_prompt_pack_source(creds: dict, ciphertext: str) -> None:
     """Record where to KMS-unwrap the PromptPack from for THIS request (called once
-    per request in main()). The unwrap itself is LAZY — only assembler ops trigger
-    it — so non-assembling ops (reseal_history / content_encrypt / unwrap_dek) keep
-    working even when no pack ciphertext is injected."""
-    global _pp_source
-    _pp_source = {"creds": creds or {}, "ciphertext": ciphertext or ""}
+    per request, in the request's own worker thread). The unwrap itself is LAZY —
+    only assembler ops trigger it — so non-assembling ops (reseal_history /
+    content_encrypt / unwrap_dek) keep working even when no pack ciphertext is
+    injected."""
+    _pp_local.src = {"creds": creds or {}, "ciphertext": ciphertext or ""}
 
 
 def active_prompt_pack() -> dict:
@@ -255,15 +297,71 @@ def active_prompt_pack() -> dict:
     a blank/identity-free prompt."""
     global _prompt_pack
     if _prompt_pack is None:
-        raw = _pp_source["ciphertext"] or PROMPTPACK_CIPHERTEXT_B64
-        if not raw:
-            raise RuntimeError("promptpack unavailable: no ciphertext injected")
-        env = json.loads(base64.b64decode(raw))
-        key = kms_decrypt(_pp_source["creds"], env["wrapped"])
-        blob = base64.b64decode(env["ct"])
-        pack_json = AESGCM(key).decrypt(blob[:12], blob[12:], None).decode("utf-8")
-        _prompt_pack = json.loads(pack_json)
+        with _pp_lock:
+            if _prompt_pack is None:
+                src = getattr(_pp_local, "src", None) or {"creds": {}, "ciphertext": ""}
+                raw = src["ciphertext"] or PROMPTPACK_CIPHERTEXT_B64
+                if not raw:
+                    raise RuntimeError("promptpack unavailable: no ciphertext injected")
+                env = json.loads(base64.b64decode(raw))
+                key = kms_decrypt(src["creds"], env["wrapped"])
+                blob = base64.b64decode(env["ct"])
+                pack_json = AESGCM(key).decrypt(blob[:12], blob[12:], None).decode("utf-8")
+                _prompt_pack = json.loads(pack_json)
     return _prompt_pack
+
+
+# ---- enclave identity (SYS-40): one persistent keypair, any attested host ----
+# Sealed blobs used to die with the host that minted them (per-boot ephemeral
+# keypair): running >1 host, or the overlap window of every host replacement,
+# meant "ValueError: Decryption failed". The identity keypair is generated
+# INSIDE an attested enclave (`identity_bootstrap` op), envelope-encrypted under
+# a dedicated PCR0-gated CMK via KMS GenerateDataKey — the plaintext private key
+# never leaves enclave memory — and stored by the operator as an opaque blob
+# (S3). Every boot lazily unwraps it from the forwarder-injected envelope; when
+# no envelope is injected (dev / pre-bootstrap fleet) we fall back to the
+# per-boot ephemeral key, i.e. exactly today's behavior. Once the identity is
+# loaded it is permanent for the process: the forwarder reads the envelope file
+# at boot, so a host either injects it on every frame or never does — clients
+# can't observe a mid-life key switch.
+_id_lock = threading.Lock()
+_identity: tuple | None = None  # (priv, pub_der) once unwrapped
+_ephemeral: tuple | None = None  # set once in main()
+
+
+def _load_privkey_envelope(creds: dict, envelope_b64: str) -> tuple:
+    """Open the identity envelope: {"wrapped": <KMS ct of AES-256 data key>,
+    "ct": b64(iv(12) || AESGCM(PKCS8 private key))}, base64-JSON — the same
+    envelope shape as the PromptPack. KMS releases the data key only into this
+    attested PCR0."""
+    env = json.loads(base64.b64decode(envelope_b64))
+    datakey = kms_decrypt(creds, env["wrapped"])
+    blob = base64.b64decode(env["ct"])
+    der = AESGCM(datakey).decrypt(blob[:12], blob[12:], None)
+    priv = serialization.load_der_private_key(der, password=None)
+    pub_der = priv.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return priv, pub_der
+
+
+def current_keys(req: dict) -> tuple:
+    """Resolve (priv, pub_der) for this request: the shared identity when the
+    forwarder injected its envelope (unwrapped once, attestation-gated), else
+    the boot-time ephemeral keypair."""
+    global _identity
+    if _identity is not None:
+        return _identity
+    envelope_b64 = req.get("identity_ciphertext", "")
+    if envelope_b64:
+        with _id_lock:
+            if _identity is None:
+                _identity = _load_privkey_envelope(
+                    req.get("aws_creds") or {}, envelope_b64
+                )
+        return _identity
+    return _ephemeral
 
 
 def _deepinfra_post(api_key: str, body: bytes) -> bytes:
@@ -1291,166 +1389,222 @@ def assemble_and_reseal(conn, priv, req: dict) -> None:
     send_frame(conn, {"done": True})
 
 
+# SYS-39: the accept loop used to dispatch SERIALLY — one in-flight chat stream
+# (30-60s+) blocked every other op, including content_decrypt (conversation
+# loads) and health pings, whose queueing delay is exactly the healthz "latency
+# creep" that got working hosts replaced (SYS-37). Dispatch is now a daemon
+# thread per connection. ping/attest stay outside the semaphore so health and
+# key fetches never queue behind streams; heavy ops share a bounded semaphore so
+# a stampede can't blow the enclave's fixed memory. All lazily-initialized
+# globals (_provider_key / _deepinfra_key / _prompt_pack / _identity) are
+# lock-guarded, and the per-request PromptPack source is thread-local.
+HEAVY_OP_LIMIT = 48
+_heavy_sem = threading.BoundedSemaphore(HEAVY_OP_LIMIT)
+
+
+def _handle_heavy(conn, req: dict, op: str, priv, pub_der) -> None:
+    with _heavy_sem:
+        if op == "chat":
+            opened = unseal(priv, base64.b64decode(req["sealed"]))
+            key = provider_key(req.get("aws_creds") or {}, req.get("provider_key_ciphertext", ""))
+            handle_chat_body(conn, priv, req, opened, key, assemble=False)
+        elif op == "assemble_chat":
+            opened = unseal(priv, base64.b64decode(req["sealed"]))
+            key = provider_key(req.get("aws_creds") or {}, req.get("provider_key_ciphertext", ""))
+            handle_chat_body(conn, priv, req, opened, key, assemble=True)
+        elif op == "reseal_history":
+            bundle = json.loads(unseal(priv, base64.b64decode(req["sealed"])))
+            user_id = bundle["user_id"]
+            dek = kms_decrypt(req.get("aws_creds") or {}, bundle["wrapped_dek"], {"userId": user_id})
+            sealer = ClientSealer(conn, base64.b64decode(bundle["client_pubkey"]))
+            for m in bundle.get("messages", []):
+                out = {
+                    "role": m.get("role"), "kind": m.get("kind"), "id": m.get("id"),
+                    "createdAt": m.get("createdAt"),
+                    "text": content_decrypt(dek, m["text"], user_id),
+                }
+                # Swipe variants (BAC-87): the API ships each variant's text as
+                # ciphertext too; decrypt them so the client rebuilds the swipe
+                # stack on reload. Present only when a message holds >1 variant.
+                variants = m.get("variants")
+                if variants:
+                    out["variants"] = [
+                        content_decrypt(dek, v, user_id) for v in variants
+                    ]
+                    out["activeVariant"] = m.get("activeVariant")
+                    # Per-variant steer labels (SYS-23): decrypt each typed
+                    # nudge's text so the swipe labels rehydrate on reload; chip
+                    # rides clear. Parallel to `variants`; null for blind rerolls.
+                    variant_steers = m.get("variantSteers")
+                    if variant_steers:
+                        out["variantSteers"] = [
+                            _reseal_steer(dek, s, user_id) for s in variant_steers
+                        ]
+                sealer.emit(out)
+            send_frame(conn, {"done": True})
+        elif op == "content_encrypt":
+            bundle = json.loads(unseal(priv, base64.b64decode(req["sealed"])))
+            user_id = bundle["user_id"]
+            dek = kms_decrypt(req.get("aws_creds") or {}, bundle["wrapped_dek"], {"userId": user_id})
+            cts = [content_encrypt(dek, v, user_id) for v in bundle["values"]]
+            send_frame(conn, {"values": cts})
+        elif op == "content_encrypt_sealed":
+            outer = json.loads(unseal(priv, base64.b64decode(req["sealed"])))
+            user_id = outer["user_id"]
+            dek = kms_decrypt(req.get("aws_creds") or {}, outer["wrapped_dek"], {"userId": user_id})
+            cts = []
+            for sv in outer["sealed_values"]:
+                pt = unseal(priv, base64.b64decode(sv)).decode("utf-8")
+                cts.append(content_encrypt(dek, pt, user_id))
+            send_frame(conn, {"values": cts})
+        elif op == "screen_encrypt_sealed":
+            # BAC-183: unseal client-sealed user-authored text (a bot-message
+            # edit or a free-text rating reason), CSAM-SCREEN it in-enclave —
+            # the only place its plaintext exists on a blind thread — then
+            # DEK-encrypt it. This is what lets operator-blind deployments
+            # accept those writes without either shipping plaintext past the
+            # operator OR bypassing the BAC-135 CSAM gate. On a block, reveal
+            # + persist NOTHING (no ciphertext) and return {"blocked": true};
+            # the API surfaces the inline block copy, exactly like a blocked
+            # user turn. Images aren't in scope here (screened API-side).
+            outer = json.loads(unseal(priv, base64.b64decode(req["sealed"])))
+            user_id = outer["user_id"]
+            dek = kms_decrypt(req.get("aws_creds") or {}, outer["wrapped_dek"], {"userId": user_id})
+            pkey = provider_key(req.get("aws_creds") or {}, req.get("provider_key_ciphertext", ""))
+            pts = [
+                unseal(priv, base64.b64decode(sv)).decode("utf-8")
+                for sv in outer["sealed_values"]
+            ]
+            if any(csam_blocks(pkey, pt) for pt in pts):
+                send_frame(conn, {"blocked": True})
+            else:
+                send_frame(conn, {
+                    "values": [content_encrypt(dek, pt, user_id) for pt in pts],
+                })
+        elif op == "score_sealed":
+            outer = json.loads(unseal(priv, base64.b64decode(req["sealed"])))
+            user_id = outer["user_id"]
+            dek = kms_decrypt(req.get("aws_creds") or {}, outer["wrapped_dek"], {"userId": user_id})
+            score = outer.get("score") or {}
+            sdto = score.get("dto") or {}
+            if sdto.get("messages"):
+                sdto["messages"] = _decrypt_turns(dek, sdto["messages"], user_id)
+                opts = sdto.get("options")
+                if isinstance(opts, dict):
+                    mem = opts.get("memory")
+                    if mem:
+                        opts["memory"] = content_decrypt(dek, mem, user_id)
+            key = provider_key(req.get("aws_creds") or {}, req.get("provider_key_ciphertext", ""))
+            sealed_reply_b64 = outer.get("sealed_reply", "")
+            reply = unseal(priv, base64.b64decode(sealed_reply_b64)).decode("utf-8")
+            try:
+                built = run_assembler([{**score, "op": "score_build", "reply": reply}])[0]
+                content = provider_json_content(key, {
+                    "model": score.get("model"),
+                    "messages": built["messages"],
+                    "stream": False,
+                    **score.get("reasoning", {}),
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.6,
+                    "max_tokens": built["maxTokens"],
+                })
+                parsed = run_assembler([{**score, "op": "score_parse", "reply": reply, "content": content}])[0]
+            except Exception:
+                parsed = None
+            love_delta = 0
+            state_out = {}
+            if parsed is not None:
+                love_delta = int(parsed.get("love") or 0)
+                state_out["love"] = love_delta
+                state_out["reason"] = parsed.get("reason", "")
+                mem = parsed.get("memory")
+                if mem:
+                    state_out["memory"] = content_encrypt(dek, mem, user_id)
+                acts = parsed.get("actions") or []
+                if len(acts):
+                    state_out["actions"] = [content_encrypt(dek, a, user_id) for a in acts]
+            send_frame(conn, {"state": state_out})
+        elif op == "assemble_reseal":
+            assemble_and_reseal(conn, priv, req)
+        elif op == "unwrap_dek":
+            dek = kms_decrypt(req.get("aws_creds") or {}, req.get("wrapped", ""))
+            send_frame(conn, {"dek_sha256": hashlib.sha256(dek).hexdigest()})
+        elif op == "identity_bootstrap":
+            # SYS-40: mint the SHARED identity keypair INSIDE the enclave. KMS
+            # GenerateDataKey (attestation-gated on the identity CMK) yields a
+            # data key whose plaintext exists only here; the RSA-3072 private
+            # key is AES-GCM-sealed under it and returned as an opaque envelope
+            # (same shape as the PromptPack's) for the operator to store (S3)
+            # and the forwarder to inject from then on. Output is ciphertext
+            # only — nothing secret reaches the host.
+            key_id = req.get("key_id", "")
+            if not key_id:
+                raise RuntimeError("identity_bootstrap: key_id required")
+            datakey, wrapped_b64 = kms_genkey(req.get("aws_creds") or {}, key_id)
+            new_priv = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+            der = new_priv.private_bytes(
+                serialization.Encoding.DER,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            )
+            iv = os.urandom(12)
+            ct = AESGCM(datakey).encrypt(iv, der, None)
+            envelope = base64.b64encode(
+                json.dumps(
+                    {"wrapped": wrapped_b64, "ct": base64.b64encode(iv + ct).decode()}
+                ).encode()
+            ).decode()
+            send_frame(conn, {"identity": envelope})
+        else:
+            send_frame(conn, {"error": "bad_op"})
+
+
+def serve_conn(conn) -> None:
+    try:
+        # Bound the initial frame read so a dead/idle peer can't pin a thread
+        # forever; streams take over the socket after dispatch with no timeout.
+        conn.settimeout(30)
+        req = recv_frame(conn)
+        conn.settimeout(None)
+        op = req.get("op")
+        # Where to KMS-unwrap the PromptPack for this request (lazy — only the
+        # assembler ops actually unwrap it; injected by the forwarder for those).
+        set_prompt_pack_source(
+            req.get("aws_creds") or {}, req.get("promptpack_ciphertext", "")
+        )
+        priv, pub_der = current_keys(req)
+        if op == "ping":
+            send_frame(conn, {"ok": True})
+        elif op == "attest":
+            nonce = base64.b64decode(req["nonce"])
+            doc = attestation_document(nonce, pub_der)
+            send_frame(conn, {"doc": base64.b64encode(doc).decode()})
+        else:
+            _handle_heavy(conn, req, op, priv, pub_der)
+    except Exception as exc:
+        try:
+            send_frame(conn, {"error": type(exc).__name__, "detail": str(exc)[:220]})
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
 def main() -> None:
+    global _ephemeral
     priv = rsa.generate_private_key(public_exponent=65537, key_size=3072)
     pub_der = priv.public_key().public_bytes(
         serialization.Encoding.DER,
         serialization.PublicFormat.SubjectPublicKeyInfo,
     )
+    _ephemeral = (priv, pub_der)
     srv = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
     srv.bind((socket.VMADDR_CID_ANY, LISTEN_PORT))
     srv.listen(128)
 
     while True:
         conn, _ = srv.accept()
-        try:
-            req = recv_frame(conn)
-            op = req.get("op")
-            # Where to KMS-unwrap the PromptPack for this request (lazy — only the
-            # assembler ops actually unwrap it; injected by the forwarder for those).
-            set_prompt_pack_source(
-                req.get("aws_creds") or {}, req.get("promptpack_ciphertext", "")
-            )
-            if op == "ping":
-                send_frame(conn, {"ok": True})
-            elif op == "attest":
-                nonce = base64.b64decode(req["nonce"])
-                doc = attestation_document(nonce, pub_der)
-                send_frame(conn, {"doc": base64.b64encode(doc).decode()})
-            elif op == "chat":
-                opened = unseal(priv, base64.b64decode(req["sealed"]))
-                key = provider_key(req.get("aws_creds") or {}, req.get("provider_key_ciphertext", ""))
-                handle_chat_body(conn, priv, req, opened, key, assemble=False)
-            elif op == "assemble_chat":
-                opened = unseal(priv, base64.b64decode(req["sealed"]))
-                key = provider_key(req.get("aws_creds") or {}, req.get("provider_key_ciphertext", ""))
-                handle_chat_body(conn, priv, req, opened, key, assemble=True)
-            elif op == "reseal_history":
-                bundle = json.loads(unseal(priv, base64.b64decode(req["sealed"])))
-                user_id = bundle["user_id"]
-                dek = kms_decrypt(req.get("aws_creds") or {}, bundle["wrapped_dek"], {"userId": user_id})
-                sealer = ClientSealer(conn, base64.b64decode(bundle["client_pubkey"]))
-                for m in bundle.get("messages", []):
-                    out = {
-                        "role": m.get("role"), "kind": m.get("kind"), "id": m.get("id"),
-                        "createdAt": m.get("createdAt"),
-                        "text": content_decrypt(dek, m["text"], user_id),
-                    }
-                    # Swipe variants (BAC-87): the API ships each variant's text as
-                    # ciphertext too; decrypt them so the client rebuilds the swipe
-                    # stack on reload. Present only when a message holds >1 variant.
-                    variants = m.get("variants")
-                    if variants:
-                        out["variants"] = [
-                            content_decrypt(dek, v, user_id) for v in variants
-                        ]
-                        out["activeVariant"] = m.get("activeVariant")
-                        # Per-variant steer labels (SYS-23): decrypt each typed
-                        # nudge's text so the swipe labels rehydrate on reload; chip
-                        # rides clear. Parallel to `variants`; null for blind rerolls.
-                        variant_steers = m.get("variantSteers")
-                        if variant_steers:
-                            out["variantSteers"] = [
-                                _reseal_steer(dek, s, user_id) for s in variant_steers
-                            ]
-                    sealer.emit(out)
-                send_frame(conn, {"done": True})
-            elif op == "content_encrypt":
-                bundle = json.loads(unseal(priv, base64.b64decode(req["sealed"])))
-                user_id = bundle["user_id"]
-                dek = kms_decrypt(req.get("aws_creds") or {}, bundle["wrapped_dek"], {"userId": user_id})
-                cts = [content_encrypt(dek, v, user_id) for v in bundle["values"]]
-                send_frame(conn, {"values": cts})
-            elif op == "content_encrypt_sealed":
-                outer = json.loads(unseal(priv, base64.b64decode(req["sealed"])))
-                user_id = outer["user_id"]
-                dek = kms_decrypt(req.get("aws_creds") or {}, outer["wrapped_dek"], {"userId": user_id})
-                cts = []
-                for sv in outer["sealed_values"]:
-                    pt = unseal(priv, base64.b64decode(sv)).decode("utf-8")
-                    cts.append(content_encrypt(dek, pt, user_id))
-                send_frame(conn, {"values": cts})
-            elif op == "screen_encrypt_sealed":
-                # BAC-183: unseal client-sealed user-authored text (a bot-message
-                # edit or a free-text rating reason), CSAM-SCREEN it in-enclave —
-                # the only place its plaintext exists on a blind thread — then
-                # DEK-encrypt it. This is what lets operator-blind deployments
-                # accept those writes without either shipping plaintext past the
-                # operator OR bypassing the BAC-135 CSAM gate. On a block, reveal
-                # + persist NOTHING (no ciphertext) and return {"blocked": true};
-                # the API surfaces the inline block copy, exactly like a blocked
-                # user turn. Images aren't in scope here (screened API-side).
-                outer = json.loads(unseal(priv, base64.b64decode(req["sealed"])))
-                user_id = outer["user_id"]
-                dek = kms_decrypt(req.get("aws_creds") or {}, outer["wrapped_dek"], {"userId": user_id})
-                pkey = provider_key(req.get("aws_creds") or {}, req.get("provider_key_ciphertext", ""))
-                pts = [
-                    unseal(priv, base64.b64decode(sv)).decode("utf-8")
-                    for sv in outer["sealed_values"]
-                ]
-                if any(csam_blocks(pkey, pt) for pt in pts):
-                    send_frame(conn, {"blocked": True})
-                else:
-                    send_frame(conn, {
-                        "values": [content_encrypt(dek, pt, user_id) for pt in pts],
-                    })
-            elif op == "score_sealed":
-                outer = json.loads(unseal(priv, base64.b64decode(req["sealed"])))
-                user_id = outer["user_id"]
-                dek = kms_decrypt(req.get("aws_creds") or {}, outer["wrapped_dek"], {"userId": user_id})
-                score = outer.get("score") or {}
-                sdto = score.get("dto") or {}
-                if sdto.get("messages"):
-                    sdto["messages"] = _decrypt_turns(dek, sdto["messages"], user_id)
-                    opts = sdto.get("options")
-                    if isinstance(opts, dict):
-                        mem = opts.get("memory")
-                        if mem:
-                            opts["memory"] = content_decrypt(dek, mem, user_id)
-                key = provider_key(req.get("aws_creds") or {}, req.get("provider_key_ciphertext", ""))
-                sealed_reply_b64 = outer.get("sealed_reply", "")
-                reply = unseal(priv, base64.b64decode(sealed_reply_b64)).decode("utf-8")
-                try:
-                    built = run_assembler([{**score, "op": "score_build", "reply": reply}])[0]
-                    content = provider_json_content(key, {
-                        "model": score.get("model"),
-                        "messages": built["messages"],
-                        "stream": False,
-                        **score.get("reasoning", {}),
-                        "response_format": {"type": "json_object"},
-                        "temperature": 0.6,
-                        "max_tokens": built["maxTokens"],
-                    })
-                    parsed = run_assembler([{**score, "op": "score_parse", "reply": reply, "content": content}])[0]
-                except Exception:
-                    parsed = None
-                love_delta = 0
-                state_out = {}
-                if parsed is not None:
-                    love_delta = int(parsed.get("love") or 0)
-                    state_out["love"] = love_delta
-                    state_out["reason"] = parsed.get("reason", "")
-                    mem = parsed.get("memory")
-                    if mem:
-                        state_out["memory"] = content_encrypt(dek, mem, user_id)
-                    acts = parsed.get("actions") or []
-                    if len(acts):
-                        state_out["actions"] = [content_encrypt(dek, a, user_id) for a in acts]
-                send_frame(conn, {"state": state_out})
-            elif op == "assemble_reseal":
-                assemble_and_reseal(conn, priv, req)
-            elif op == "unwrap_dek":
-                dek = kms_decrypt(req.get("aws_creds") or {}, req.get("wrapped", ""))
-                send_frame(conn, {"dek_sha256": hashlib.sha256(dek).hexdigest()})
-            else:
-                send_frame(conn, {"error": "bad_op"})
-        except Exception as exc:
-            try:
-                send_frame(conn, {"error": type(exc).__name__, "detail": str(exc)[:220]})
-            except Exception:
-                pass
-        finally:
-            conn.close()
+        threading.Thread(target=serve_conn, args=(conn,), daemon=True).start()
 
 
 if __name__ == "__main__":
