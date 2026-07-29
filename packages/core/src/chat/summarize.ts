@@ -34,7 +34,7 @@ export function excerptTurns(dropped: SummarizeTurn[], name: string): string {
       const text = m.text.startsWith(GIFT_MARKER)
         ? m.text.replace(GIFT_MARKER, "(gift)")
         : m.text;
-      return `${who}: ${text.slice(0, 400)}`;
+      return `${who}: ${text.slice(0, 600)}`;
     })
     .join("\n");
 }
@@ -142,7 +142,14 @@ export function parseChapters(
             typeof (c as SummaryChapter).text === "string" &&
             !!(c as SummaryChapter).text.trim(),
         );
-        if (out.length) return out;
+        if (out.length) {
+          // Defensive sort + dedupe (L5): the log should ascend by `upto` with
+          // no duplicate watermarks, but a corrupt/migrated row could violate
+          // that — sort and keep the first entry per `upto` so a malformed log
+          // can't break the chapter math downstream.
+          out.sort((a, b) => a.upto - b.upto);
+          return out.filter((c, i) => i === 0 || c.upto !== out[i - 1]!.upto);
+        }
       }
     } catch {
       /* fall through to the legacy seed */

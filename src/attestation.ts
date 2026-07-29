@@ -26,11 +26,19 @@ const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
 // bump these WITH measurements.json and re-publish the attestation mirror BEFORE
 // flipping the fleet, or every client's check fails.
 const EXPECTED_PCR0 =
-  "4967bd57a4e013c2b702b7d23c12e6b61d1435fc7319940b39857d26262a0fc3c2a97fe2d2a0766a3f1404eb345e5e9b";
+  "4743a7088a39061cda5f66ba53254bd60aa137c54f1b10835bed04fb6e1302d9ec5ed6a1ad148a6a9d74fd383556ee56";
+// Non-empty only during a measured image rollover. Both values are compiled
+// into the public client; remove the old pin as soon as the old fleet drains.
+const PREVIOUS_PCR0 =
+  "c1c6b1ec209cb725a0225338ebbb5dd644e44adf1f0fbaaf331b4c77a552810d835ae333094d6770085689d44e3e31d5";
+const PREVIOUS_PCR1 =
+  "3b4a7e1b5f13c5a1000b3ed32ef8995ee13e9876329f9bc72650b918329ef9cf4e2e4d1e1e37375dab0ba56ba0974d03";
+const PREVIOUS_PCR2 =
+  "23af9a164e023ac7f11fa303143d3fd53df0ff04aba8a5eed90500702323620c5eed16f000007a84102708287db2f9fe";
 const EXPECTED_PCR1 =
   "3b4a7e1b5f13c5a1000b3ed32ef8995ee13e9876329f9bc72650b918329ef9cf4e2e4d1e1e37375dab0ba56ba0974d03";
 const EXPECTED_PCR2 =
-  "0e416aaf9e7b8f249227197159a2b9d276b783c91a5a07210517429ab9cdb6aebc3b19f34ac2d58d659a23caca789e74";
+  "8fc16259307ac7c0ccdab53dba04ac9aca887d1a02e3a2b7d3b30bce50e9ebbdffccee5e88eebca710af40e817cfe6b3";
 
 export interface Check {
   ok: boolean;
@@ -133,11 +141,21 @@ export async function verifyAttestation(
   // bundle (EXPECTED_PCR0/1/2) — NOT taken from the API response — so the operator
   // can't hand the browser a matching "expected" value for a swapped image. PCR1
   // (kernel/boot) and PCR2 (app/rootfs) are checked alongside PCR0 for full pinning.
-  add(pcr0.toLowerCase() === EXPECTED_PCR0.toLowerCase(), "Running the published code",
+  const acceptedMeasurements = [
+    [EXPECTED_PCR0, EXPECTED_PCR1, EXPECTED_PCR2],
+    [PREVIOUS_PCR0, PREVIOUS_PCR1, PREVIOUS_PCR2],
+  ].filter((tuple) => tuple.every(Boolean));
+  const tupleOk = acceptedMeasurements.some(
+    ([p0, p1, p2]) =>
+      pcr0.toLowerCase() === p0!.toLowerCase() &&
+      pcr1.toLowerCase() === p1!.toLowerCase() &&
+      pcr2.toLowerCase() === p2!.toLowerCase(),
+  );
+  add(tupleOk, "Running the published code",
     `PCR0 ${pcr0.slice(0, 24)}...`);
-  add(pcr1.toLowerCase() === EXPECTED_PCR1.toLowerCase(), "Pinned boot measurement (PCR1)",
+  add(tupleOk, "Pinned boot measurement (PCR1)",
     `PCR1 ${pcr1.slice(0, 24)}...`);
-  add(pcr2.toLowerCase() === EXPECTED_PCR2.toLowerCase(), "Pinned app measurement (PCR2)",
+  add(tupleOk, "Pinned app measurement (PCR2)",
     `PCR2 ${pcr2.slice(0, 24)}...`);
 
   // 5. Freshness: the doc answers THIS challenge, recently.
@@ -182,4 +200,12 @@ export async function getVerifiedEnclavePublicKey(): Promise<Uint8Array> {
   const key = new Uint8Array(pk as ArrayBuffer);
   _pubkeyCache = { key, expires: now + PUBKEY_TTL_MS };
   return key;
+}
+
+/** Drop the cached enclave pubkey so the NEXT seal re-attests (BAC-205). Called
+ *  on enclave-flavored stream failures — the cached key may belong to a host
+ *  that no longer exists (replacement / identity rotation), and without this
+ *  every retry inside the TTL keeps sealing to the dead host's key. */
+export function invalidateEnclavePubkeyCache(): void {
+  _pubkeyCache = null;
 }

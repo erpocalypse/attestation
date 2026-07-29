@@ -3,9 +3,10 @@ Inkwell confidential enclave — processes every chat turn in plaintext inside a
 sealed AWS Nitro environment. No network interface, no standing credentials.
 Operator-blind by construction: the parent relays ciphertext it can't open.
 
-Egress is a single vsock-proxy tunnel to a configurable provider endpoint.
-BYOK reseals the prompt to the client instead (the enclave can't reach
-arbitrary user-specified endpoints). Scoring runs through the same tunnel.
+Egress is restricted to dedicated vsock-proxy tunnels for KMS and each measured
+first-party provider. BYOK reseals the prompt to the client instead (the enclave
+can't reach arbitrary user-specified endpoints). Scoring/folds use Squid even
+when Octopus/MiMo answers the user-visible reply.
 
 Reference implementation — the published source that produces the PCR0
 measurement users verify against their browser's attestation document.
@@ -28,16 +29,21 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from memory_cadence import apply_memory_checkpoint
+from provider_routing import (
+    attach_image_parts,
+    prepare_reply_body,
+    provider_http_status,
+    provider_request,
+    provider_usage_event,
+    reply_provider_target,
+)
+
 PARENT_CID = 3
 KMS_VSOCK_PORT = 8001
-PROVIDER_VSOCK_PORT = 8002
 LISTEN_PORT = 5005
 
 KMS_REGION = os.environ.get("KMS_REGION", "us-west-2")
-PROVIDER_HOST = os.environ.get("PROVIDER_HOST")
-if PROVIDER_HOST is None:
-    raise RuntimeError("PROVIDER_HOST is required")
-PROVIDER_PATH = os.environ.get("PROVIDER_PATH", "/chat/completions")
 PROVIDER_KEY_CIPHERTEXT_B64 = os.environ.get("PROVIDER_KEY_CIPHERTEXT_B64", "")
 # PromptPack (BAC-136): the proprietary prompt CONTENT (jailbreak, world canon,
 # scoring/anti-slop rubric). KMS-wrapped and injected per request by the host
@@ -45,6 +51,7 @@ PROVIDER_KEY_CIPHERTEXT_B64 = os.environ.get("PROVIDER_KEY_CIPHERTEXT_B64", "")
 # this PCR0. The compiled assembler binary carries NONE of it, so PCR0 is
 # reproducible from public source; the content arrives as runtime data instead.
 PROMPTPACK_CIPHERTEXT_B64 = os.environ.get("PROMPTPACK_CIPHERTEXT_B64", "")
+MIMO_KEY_CIPHERTEXT_B64 = os.environ.get("MIMO_KEY_CIPHERTEXT_B64", "")
 ATT_DOC_MAX = 16 * 1024
 
 # ---- CSAM moderation (operator-blind text screen) --------------------------
@@ -244,6 +251,24 @@ def provider_key(creds: dict, ciphertext: str = "") -> str:
     return _provider_key
 
 
+_mimo_key: str | None = None
+
+
+def mimo_key(creds: dict, ciphertext: str = "") -> str:
+    """Lazy-fetch the MiMo API key via the same attestation-gated provider CMK.
+    It has a distinct ciphertext/cache so Squid and Octopus never share or
+    overwrite credentials inside the enclave."""
+    global _mimo_key
+    if _mimo_key is None:
+        with _key_lock:
+            if _mimo_key is None:
+                ct = ciphertext or MIMO_KEY_CIPHERTEXT_B64
+                if not ct:
+                    raise RuntimeError("no MiMo-key ciphertext")
+                _mimo_key = kms_decrypt(creds, ct).decode("utf-8").strip()
+    return _mimo_key
+
+
 _deepinfra_key: str | None = None
 
 
@@ -393,7 +418,9 @@ def _deepinfra_post(api_key: str, body: bytes) -> bytes:
         tls.close()
 
 
-def csam_blocks(provider_key: str, text: str) -> bool:
+def csam_blocks(
+    provider_key: str, text: str, usage_events: list | None = None
+) -> bool:
     """True iff `text` is classified CSAM. BAC-183: screens via the platform
     provider (deepseek-v4-flash on CROF) over the SAME egress tunnel chat uses —
     no separate DeepInfra tunnel/key, matching the API side. Text-only (image
@@ -404,7 +431,7 @@ def csam_blocks(provider_key: str, text: str) -> bool:
     if not provider_key or not text or not text.strip():
         return False
     try:
-        content = provider_json_content(provider_key, {
+        response = provider_json_response(provider_key, {
             "model": CSAM_MODEL,
             "temperature": 0,
             "max_tokens": 80,
@@ -413,6 +440,21 @@ def csam_blocks(provider_key: str, text: str) -> bool:
                 {"role": "user", "content": text[:12000]},
             ],
         })
+        if isinstance(response, dict):
+            event = provider_usage_event(
+                "moderation",
+                response.get("usage"),
+                reply_provider_target("squid"),
+            )
+            if usage_events is not None:
+                usage_events.append(event)
+            content = (
+                response.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content")
+            )
+        else:
+            content = None
         if not content:
             return False
         m = _CSAM_JSON_RE.search(content)
@@ -423,22 +465,19 @@ def csam_blocks(provider_key: str, text: str) -> bool:
         return False
 
 
-# ---- provider egress: TLS over the host vsock-proxy tunnel ------------------
-def stream_provider(conn: socket.socket, api_key: str, body: bytes) -> None:
+# ---- provider egress: TLS over host allow-listed vsock tunnels --------------
+def stream_provider(
+    conn: socket.socket, api_key: str, body: bytes, target: dict | None = None
+) -> None:
     """POST to the provider, stream the response back as it arrives.
     Each TLS read is forwarded as a {"chunk": b64} frame, terminated by {"done": true}."""
+    target = target or reply_provider_target("squid")
     raw = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
-    raw.connect((PARENT_CID, PROVIDER_VSOCK_PORT))
+    raw.connect((PARENT_CID, target["port"]))
     ctx = ssl.create_default_context()
-    tls = ctx.wrap_socket(raw, server_hostname=PROVIDER_HOST)
+    tls = ctx.wrap_socket(raw, server_hostname=target["host"])
     try:
-        req = (
-            f"POST {PROVIDER_PATH} HTTP/1.1\r\nHost: {PROVIDER_HOST}\r\n"
-            f"Authorization: Bearer {api_key.strip()}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
-        ).encode() + body
-        tls.sendall(req)
+        tls.sendall(provider_request(target, api_key, body))
         while True:
             b = tls.recv(65536)
             if not b:
@@ -596,24 +635,20 @@ def scrub_stray_cjk(text: str) -> str:
 
 
 # ---- provider call helpers (sealed reply path) ------------------------------
-def _provider_tls() -> ssl.SSLSocket:
+def _provider_tls(target: dict | None = None) -> ssl.SSLSocket:
+    target = target or reply_provider_target("squid")
     raw = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
-    raw.connect((PARENT_CID, PROVIDER_VSOCK_PORT))
+    raw.connect((PARENT_CID, target["port"]))
     ctx = ssl.create_default_context()
-    return ctx.wrap_socket(raw, server_hostname=PROVIDER_HOST)
+    return ctx.wrap_socket(raw, server_hostname=target["host"])
 
 
 def _provider_post(api_key: str, body: bytes) -> bytes:
     """POST to the provider, return full raw HTTP response. Used for non-streaming scoring."""
-    tls = _provider_tls()
+    target = reply_provider_target("squid")
+    tls = _provider_tls(target)
     try:
-        req = (
-            f"POST {PROVIDER_PATH} HTTP/1.1\r\nHost: {PROVIDER_HOST}\r\n"
-            f"Authorization: Bearer {api_key.strip()}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
-        ).encode() + body
-        tls.sendall(req)
+        tls.sendall(provider_request(target, api_key, body))
         out = b""
         while True:
             b = tls.recv(65536)
@@ -670,38 +705,16 @@ def provider_json_content(api_key: str, body: dict) -> str | None:
 
 
 # ---- cost calculation -------------------------------------------------------
-def turn_cost_micros(usage: dict | None) -> int:
-    """Token usage → cost in micro-dollars, matching @erpocalypse/api/chat/usage-cost."""
-    if not usage:
-        return 0
-    hit = usage.get("prompt_cache_hit_tokens") or 0
-    miss = usage.get("prompt_cache_miss_tokens") or 0
-    if not hit and not miss:
-        details = usage.get("prompt_tokens_details") or {}
-        hit = details.get("cached_tokens") or 0
-        total = usage.get("prompt_tokens") or 0
-        miss = max(0, total - hit)
-    if hit < 0:
-        hit = 0
-    if miss < 0:
-        miss = 0
-    total_t = hit + miss
-    if total_t == 0:
-        total_t = usage.get("prompt_tokens") or 0
-        miss = total_t - hit
-    completion = usage.get("completion_tokens") or 0
-    raw = miss * 0.12 + hit * 0.003 + completion * 0.21
-    return max(0, round(raw))
-
-
 # ---- operator-blind streaming reply -----------------------------------------
 def stream_sealed_reply(
-    conn, sealer: "ClientSealer", api_key: str, body: bytes,
+    conn, sealer: "ClientSealer", reply_api_key: str, helper_api_key: str,
+    reply_target: dict, body: bytes,
     score_req: dict | None, dek: bytes | None, user_id: str | None,
     user_msg_pt: str | None = None, user_msg_kind: str | None = None,
     fold_job: dict | None = None,
     aws_creds: dict | None = None, di_ciphertext: str = "",
     steer_text_pt: str | None = None,
+    persist_memory: bool = True,
 ) -> None:
     """SSE reply path: parse provider stream in-enclave, seal each delta to the
     client session key as {"e": {"t": delta}}. At stream end, run scoring in-
@@ -718,11 +731,14 @@ def stream_sealed_reply(
     import threading
 
     mod: dict = {"v": None}
+    moderation_usage: list[dict] = []
     mod_thread = None
     if DEEPINFRA_HOST and user_msg_pt and user_msg_pt.strip():
         def _screen() -> None:
             try:
-                mod["v"] = csam_blocks(api_key, user_msg_pt)
+                mod["v"] = csam_blocks(
+                    helper_api_key, user_msg_pt, moderation_usage
+                )
             except Exception:
                 mod["v"] = False
         mod_thread = threading.Thread(target=_screen, daemon=True)
@@ -732,16 +748,10 @@ def stream_sealed_reply(
     buffered: list[str] = []
     released = mod["v"] is False
     blocked = False
-    tls = _provider_tls()
+    tls = _provider_tls(reply_target)
     full_reply = ""
     try:
-        req = (
-            f"POST {PROVIDER_PATH} HTTP/1.1\r\nHost: {PROVIDER_HOST}\r\n"
-            f"Authorization: Bearer {api_key.strip()}\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
-        ).encode() + body
-        tls.sendall(req)
+        tls.sendall(provider_request(reply_target, reply_api_key, body))
         buf = b""
         headers_done = False
         chunked = False
@@ -757,7 +767,13 @@ def stream_sealed_reply(
                 idx = buf.find(b"\r\n\r\n")
                 if idx < 0:
                     continue
-                hdr = buf[:idx].decode("latin1").lower()
+                header_bytes = buf[:idx]
+                status = provider_http_status(header_bytes)
+                if status < 200 or status >= 300:
+                    raise RuntimeError(
+                        f"{reply_target['id']} provider HTTP {status}"
+                    )
+                hdr = header_bytes.decode("latin1").lower()
                 chunked = "transfer-encoding" in hdr and "chunked" in hdr
                 buf = buf[idx + 4 :]
                 headers_done = True
@@ -811,14 +827,15 @@ def stream_sealed_reply(
                             continue
                         if v is True:
                             blocked = True
-                            break
+                            # Keep draining the already-started provider stream
+                            # without releasing content so its final usage frame
+                            # is metered even on a blocked attempt.
+                            continue
                         for d in buffered:  # safe → flush held deltas, go live
                             sealer.emit({"t": d})
                         buffered = []
                         released = True
                     sealer.emit({"t": delta})
-            if blocked:
-                break
     finally:
         tls.close()
 
@@ -834,11 +851,33 @@ def stream_sealed_reply(
                 sealer.emit({"t": d})
             buffered = []
             released = True
+    usage_events = [
+        provider_usage_event("reply", reply_usage, reply_target),
+        *moderation_usage,
+    ]
     if blocked:
         # CSAM: reveal nothing, persist nothing (no ciphertext / user_message in
-        # meta). The clear {blocked} flag is mapped to the inline block error by
-        # the API; {done} terminates the stream.
-        send_frame(conn, {"meta": {"blocked": True}})
+        # meta). Non-content usage is still returned so blocked attempts cannot
+        # bypass the daily meter or profitability ledger.
+        measured_events = [
+            event
+            for event in usage_events
+            if event["cost_micros"] > 0
+            or event["prompt_tokens"] > 0
+            or event["completion_tokens"] > 0
+        ]
+        send_frame(
+            conn,
+            {
+                "meta": {
+                    "blocked": True,
+                    "cost_micros": sum(
+                        event["cost_micros"] for event in measured_events
+                    ),
+                    "usage_events": measured_events,
+                }
+            },
+        )
         send_frame(conn, {"done": True})
         return
 
@@ -849,8 +888,9 @@ def stream_sealed_reply(
             built = run_assembler(
                 [{**score_req, "op": "score_build", "reply": full_reply}]
             )[0]
-            content = provider_json_content(
-                api_key, {
+            score_response = provider_json_response(
+                helper_api_key,
+                {
                     "model": score_req["model"],
                     "messages": built["messages"],
                     "stream": False,
@@ -860,11 +900,25 @@ def stream_sealed_reply(
                     "max_tokens": built["maxTokens"],
                 },
             )
+            helper_target = reply_provider_target("squid")
+            if isinstance(score_response, dict):
+                usage_events.append(
+                    provider_usage_event(
+                        "score", score_response.get("usage"), helper_target
+                    )
+                )
+            content = (
+                score_response.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content")
+                if isinstance(score_response, dict)
+                else None
+            )
             parsed = run_assembler(
                 [{**score_req, "op": "score_parse", "reply": full_reply, "content": content}]
             )[0]
             if parsed is not None:
-                state = parsed
+                state = apply_memory_checkpoint(parsed, persist_memory)
                 love_delta = int(parsed.get("love") or 0)
         except Exception:
             state = None
@@ -877,20 +931,29 @@ def stream_sealed_reply(
     fold_out = None
     facts_out = None
     if fold_job is not None and dek is not None and user_id is not None:
-        fold_out = run_summary_fold(api_key, dek, user_id, fold_job)
+        fold_out = run_summary_fold(
+            helper_api_key, dek, user_id, fold_job, usage_events
+        )
         # Fact rescue (BAC-116/118): only after a landed fold (same dropped
         # turns), building on the memory computeState just merged when this
         # turn was scored — mirroring the direct path's precedence.
         if fold_out is not None:
             base_memory = (state or {}).get("memory") or fold_job.get("prev_memory")
-            facts_out = run_fact_rescue(api_key, dek, user_id, fold_job, base_memory)
+            facts_out = run_fact_rescue(
+                helper_api_key, dek, user_id, fold_job, base_memory, usage_events
+            )
+    measured_events = [
+        event
+        for event in usage_events
+        if event["cost_micros"] > 0
+        or event["prompt_tokens"] > 0
+        or event["completion_tokens"] > 0
+    ]
     meta: dict = {
         "love": love_delta,
         "finish_reason": finish_reason,
-        "cost_micros": turn_cost_micros(reply_usage)
-        + (25 if score_req is not None else 0)
-        + (fold_out.get("cost_micros", 0) if fold_out else 0)
-        + (facts_out.get("cost_micros", 0) if facts_out else 0),
+        "cost_micros": sum(event["cost_micros"] for event in measured_events),
+        "usage_events": measured_events,
     }
     if fold_out:
         meta["summary_ciphertext"] = fold_out["summary_ciphertext"]
@@ -1146,7 +1209,9 @@ def extract_fold_job(bundle: dict) -> dict | None:
     }
 
 
-def _fold_provider_call(api_key: str, job: dict, built: dict):
+def _fold_provider_call(
+    api_key: str, job: dict, built: dict, usage_events: list | None = None
+):
     """One non-streaming platform call for a fold-pipeline request (chapter,
     roll-up, fact rescue): returns (content, cost_micros) or (None, 0)."""
     j = provider_json_response(api_key, {
@@ -1159,13 +1224,24 @@ def _fold_provider_call(api_key: str, job: dict, built: dict):
     })
     if not isinstance(j, dict):
         return None, 0
+    event = provider_usage_event(
+        "summary", j.get("usage"), reply_provider_target("squid")
+    )
+    if usage_events is not None:
+        usage_events.append(event)
     content = j.get("choices", [{}])[0].get("message", {}).get("content")
     if not isinstance(content, str) or not content.strip():
-        return None, turn_cost_micros(j.get("usage"))
-    return content, turn_cost_micros(j.get("usage"))
+        return None, event["cost_micros"]
+    return content, event["cost_micros"]
 
 
-def run_summary_fold(api_key: str, dek: bytes, user_id: str, job: dict) -> dict | None:
+def run_summary_fold(
+    api_key: str,
+    dek: bytes,
+    user_id: str,
+    job: dict,
+    usage_events: list | None = None,
+) -> dict | None:
     """Chapter fold (BAC-113/118), replacing the legacy cumulative merge: the
     assembler's chapter_build/chapter_apply ops (the API foldChapter's own
     functions) bracket one platform call for the new chapter, plus at most one
@@ -1186,7 +1262,7 @@ def run_summary_fold(api_key: str, dek: bytes, user_id: str, job: dict) -> dict 
         built = run_assembler([{**base, "op": "chapter_build"}])[0]
         if not isinstance(built, dict):
             return None
-        content, cost = _fold_provider_call(api_key, job, built)
+        content, cost = _fold_provider_call(api_key, job, built, usage_events)
         if content is None:
             return None
         apply_req = {
@@ -1202,7 +1278,9 @@ def run_summary_fold(api_key: str, dek: bytes, user_id: str, job: dict) -> dict 
         if isinstance(rollup, dict):
             # Roll-up failure keeps the (over-budget) unrolled log — the next
             # fold retries; never silently lose chapters.
-            merged, c2 = _fold_provider_call(api_key, job, rollup)
+            merged, c2 = _fold_provider_call(
+                api_key, job, rollup, usage_events
+            )
             cost += c2
             if merged is not None:
                 applied2 = run_assembler([{**apply_req, "merged": merged}])[0]
@@ -1221,7 +1299,12 @@ def run_summary_fold(api_key: str, dek: bytes, user_id: str, job: dict) -> dict 
 
 
 def run_fact_rescue(
-    api_key: str, dek: bytes, user_id: str, job: dict, current_memory
+    api_key: str,
+    dek: bytes,
+    user_id: str,
+    job: dict,
+    current_memory,
+    usage_events: list | None = None,
 ) -> dict | None:
     """Fact rescue (BAC-116/118, Plus+ — the API only sends `facts` budgets for
     paid plans): durable facts in the folded-out turns graduate into the
@@ -1242,7 +1325,7 @@ def run_fact_rescue(
         }])[0]
         if not isinstance(built, dict):
             return None
-        content, cost = _fold_provider_call(api_key, job, built)
+        content, cost = _fold_provider_call(api_key, job, built, usage_events)
         if content is None:
             return None
         applied = run_assembler([
@@ -1259,10 +1342,21 @@ def run_fact_rescue(
 
 
 # ---- command dispatch -------------------------------------------------------
-def handle_chat_body(conn, priv, req: dict, opened: bytes, api_key: str, assemble: bool) -> None:
+def handle_chat_body(
+    conn, priv, req: dict, opened: bytes, helper_api_key: str, assemble: bool
+) -> None:
     """Dispatch a chat/assemble_chat to either legacy relay or sealed-reply path."""
     if assemble:
         bundle = json.loads(opened)
+        reply_target = reply_provider_target(bundle.get("platform_model"))
+        reply_api_key = (
+            mimo_key(
+                req.get("aws_creds") or {},
+                req.get("mimo_key_ciphertext", ""),
+            )
+            if reply_target["id"] == "octopus"
+            else helper_api_key
+        )
         client_pubkey = bundle.get("client_pubkey")
         score = bundle.get("score")
         wrapped_dek = bundle.get("wrapped_dek")
@@ -1288,8 +1382,18 @@ def handle_chat_body(conn, priv, req: dict, opened: bytes, api_key: str, assembl
                 if score is not None:
                     score["lore"] = lore
         body["messages"] = assemble_messages([bundle["assemble"]])[0]
+        body = prepare_reply_body(body, reply_target)
+        # SYS-43: fold this turn's clear image attachments (ownership-checked +
+        # CSAM-screened API-side — images aren't operator-blind) into the last
+        # user turn as vision parts. No-op on text turns and non-vision
+        # targets, so those requests stay byte-identical to a pre-SYS-43 image.
+        attach_image_parts(
+            body["messages"], bundle.get("attachment_images"), reply_target
+        )
         bundle["__dek"] = sealed_dek
     else:
+        reply_target = reply_provider_target("squid")
+        reply_api_key = helper_api_key
         parsed = json.loads(opened)
         if isinstance(parsed, dict) and "client_pubkey" in parsed:
             body = parsed["body"]
@@ -1298,11 +1402,13 @@ def handle_chat_body(conn, priv, req: dict, opened: bytes, api_key: str, assembl
             wrapped_dek = parsed.get("wrapped_dek")
             user_id = parsed.get("user_id")
         else:
-            stream_provider(conn, api_key, opened)
+            stream_provider(conn, helper_api_key, opened, reply_target)
             return
 
     if not client_pubkey:
-        stream_provider(conn, api_key, json.dumps(body).encode())
+        stream_provider(
+            conn, reply_api_key, json.dumps(body).encode(), reply_target
+        )
         return
 
     dek = bundle.get("__dek") if assemble else None
@@ -1322,7 +1428,8 @@ def handle_chat_body(conn, priv, req: dict, opened: bytes, api_key: str, assembl
 
     sealer = ClientSealer(conn, base64.b64decode(client_pubkey))
     stream_sealed_reply(
-        conn, sealer, api_key, json.dumps(body).encode(), score, dek, user_id,
+        conn, sealer, reply_api_key, helper_api_key, reply_target,
+        json.dumps(body).encode(), score, dek, user_id,
         user_msg_pt, user_msg_kind,
         bundle.get("__fold_job") if assemble else None,
         aws_creds=req.get("aws_creds") or {},
@@ -1330,6 +1437,7 @@ def handle_chat_body(conn, priv, req: dict, opened: bytes, api_key: str, assembl
         # SYS-23: the unsealed typed nudge (set by decrypt_bundle_content), so the
         # reply meta can DEK-encrypt it onto the new swipe variant.
         steer_text_pt=bundle.get("__steer_pt") if assemble else None,
+        persist_memory=(bundle.get("persist_memory") is not False) if assemble else True,
     )
 
 
@@ -1362,16 +1470,26 @@ def assemble_and_reseal(conn, priv, req: dict) -> None:
     # turns don't otherwise need it; if it's unavailable the fold is skipped
     # (best-effort, like every other fold failure).
     if fold_job is not None and dek is not None and user_id is not None:
+        fold_usage_events: list[dict] = []
         try:
             key = provider_key(
                 req.get("aws_creds") or {}, req.get("provider_key_ciphertext", "")
             )
-            fold_out = run_summary_fold(key, dek, user_id, fold_job)
+            fold_out = run_summary_fold(
+                key, dek, user_id, fold_job, fold_usage_events
+            )
             # Fact rescue on BYOK reseal turns (BAC-116/118): no scored state at
             # assemble time, so the pre-turn recollection is the base; the later
             # /byok-turn scoring reloads the rescued note and merges on top.
             facts_out = (
-                run_fact_rescue(key, dek, user_id, fold_job, fold_job.get("prev_memory"))
+                run_fact_rescue(
+                    key,
+                    dek,
+                    user_id,
+                    fold_job,
+                    fold_job.get("prev_memory"),
+                    fold_usage_events,
+                )
                 if fold_out is not None
                 else None
             )
@@ -1384,7 +1502,18 @@ def assemble_and_reseal(conn, priv, req: dict) -> None:
             meta["summarized_upto"] = fold_out["summarized_upto"]
         if facts_out:
             meta["memory_ciphertext"] = facts_out["memory_ciphertext"]
-            meta["cost_micros"] = fold_out["cost_micros"]
+        measured_fold_events = [
+            event
+            for event in fold_usage_events
+            if event["cost_micros"] > 0
+            or event["prompt_tokens"] > 0
+            or event["completion_tokens"] > 0
+        ]
+        if measured_fold_events:
+            meta["usage_events"] = measured_fold_events
+            meta["cost_micros"] = sum(
+                event["cost_micros"] for event in measured_fold_events
+            )
     send_frame(conn, {"meta": meta})
     send_frame(conn, {"done": True})
 
@@ -1572,8 +1701,23 @@ def serve_conn(conn) -> None:
         set_prompt_pack_source(
             req.get("aws_creds") or {}, req.get("promptpack_ciphertext", "")
         )
+        if op == "readiness" and not req.get("identity_ciphertext"):
+            raise RuntimeError("shared identity unavailable")
         priv, pub_der = current_keys(req)
         if op == "ping":
+            send_frame(conn, {"ok": True})
+        elif op == "readiness":
+            # Exercise every required encrypted boot artifact before the ALB
+            # admits this host. No paid provider request is made here.
+            provider_key(
+                req.get("aws_creds") or {},
+                req.get("provider_key_ciphertext", ""),
+            )
+            mimo_key(
+                req.get("aws_creds") or {},
+                req.get("mimo_key_ciphertext", ""),
+            )
+            active_prompt_pack()
             send_frame(conn, {"ok": True})
         elif op == "attest":
             nonce = base64.b64decode(req["nonce"])

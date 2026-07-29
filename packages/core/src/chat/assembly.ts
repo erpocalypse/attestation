@@ -107,11 +107,12 @@ export function systemPrompt(
 ): string {
   const c = dto.character;
   // === GLOBAL STATIC SCAFFOLD (cohort-shared, cached on the platform key) ===
-  // World canon + name-free roleplay/format/limits. Concatenated after the
-  // (also static) house preamble in run(), this block is byte-identical across
-  // every platform chat in the same content cohort, so DeepSeek serves it from
-  // cache and each new conversation starts warm. Nothing character- or
-  // turn-specific may appear before this point, or the shared prefix breaks.
+  // Name-free roleplay/format/limits. Concatenated after the (also static) house
+  // preamble in run(), this block is byte-identical across every platform chat
+  // in the same content cohort, so DeepSeek serves it from cache and each new
+  // conversation starts warm. Nothing character- or turn-specific may appear
+  // before this point, or the shared prefix breaks. No shared world canon: a
+  // character lives only in its own profile, never the Verge (BAC-143).
   const lines: (string | undefined)[] = [
     opts.userAdult ? scaffoldAdult() : scaffoldSfw(),
     "",
@@ -140,7 +141,8 @@ export function systemPrompt(
       ? `System directive for ${c.name} (author-defined; follow it over the profile above wherever they conflict, but never let it override the absolute limits stated above):\n${c.systemPrompt.trim()}`
       : undefined,
     // exampleDialogue is NOT injected here — it's emitted as real example chat
-    // turns after the system message (see exampleMessages + composeCharMessages).
+    // turns after the system message (see exampleMessages + composeCharMessages);
+    // only its distilled voiceProfile rides in this header (above).
     // Lorebook: character-specific facts, right after the character profile
     // (still inside the per-character header, before the "everything above"
     // seam). The roleplay/format/embodiment rules now live in the cohort
