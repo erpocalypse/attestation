@@ -36,7 +36,6 @@ from provider_routing import (
     provider_http_status,
     provider_request,
     provider_usage_event,
-    reply_prompt_variant,
     reply_provider_target,
 )
 from reply_integrity import canonical_score_dto, scrub_stray_cjk
@@ -1563,11 +1562,11 @@ def handle_chat_body(
         assemble_request = bundle.get("assemble")
         if not isinstance(assemble_request, dict):
             raise RuntimeError("missing assemble request")
-        # Provider-specific prompt selection is enforced beside provider routing,
-        # rather than trusted from the API-supplied assembly payload. Squid keeps
-        # the default cached prefix; Octopus receives the identity-free MiMo
-        # commitment before the shared house preamble.
-        assemble_request["promptVariant"] = reply_prompt_variant(reply_target)
+        # Every provider shares ONE prompt: the per-provider variant layer was
+        # removed with the BAC-213 prompt restore. Strip any API-supplied value
+        # so a stale caller can't steer prompt selection from outside the
+        # measured image.
+        assemble_request.pop("promptVariant", None)
         reply_api_key = helper_api_key
         client_pubkey = bundle.get("client_pubkey")
         score = bundle.get("score")

@@ -49,11 +49,6 @@ def reply_provider_target(platform_model: str | None) -> dict:
     }
 
 
-def reply_prompt_variant(target: dict) -> str:
-    """Choose the prompt preamble beside the measured reply-provider route."""
-    return "mimo" if target.get("id") == "octopus" else "default"
-
-
 def prepare_reply_body(body: dict, target: dict) -> dict:
     """Enforce provider-specific model and reasoning knobs in-enclave."""
     out = dict(body)

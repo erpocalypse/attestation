@@ -446,8 +446,6 @@ export function buildMessages(
  *  request bytes (prefix cache). The history is `dto.messages`. */
 export interface ComposeCharArgs {
   adult: boolean;
-  /** Provider-specific prompt tuning. Omitted/default preserves Squid bytes. */
-  promptVariant?: ChatPromptVariant;
   dto: ChatContext;
   opts: EffectiveOptions;
   lore?: LoreInjection;
@@ -456,8 +454,6 @@ export interface ComposeCharArgs {
   rollingSummary?: string;
 }
 
-export type ChatPromptVariant = "default" | "mimo";
-
 /** Prepend the house preamble (adult/SFW) + top-of-prompt lore to a per-turn
  *  system prompt. The single source for the system-message head, shared by the
  *  API's run() and the enclave's compose ops so the cached prefix is identical. */
@@ -465,13 +461,8 @@ export function composeSystemContent(
   adult: boolean,
   lore: LoreInjection | undefined,
   systemPromptStr: string,
-  promptVariant: ChatPromptVariant = "default",
 ): string {
-  const preamble = adult
-    ? promptVariant === "mimo"
-      ? (pack().mimoHousePreamble ?? pack().housePreamble)
-      : pack().housePreamble
-    : pack().sfwPreamble;
+  const preamble = adult ? pack().housePreamble : pack().sfwPreamble;
   const topBlock = lore?.top.length
     ? `WORLD & SETTING NOTES:\n${lore.top.join("\n")}\n\n`
     : "";
@@ -583,7 +574,6 @@ export function composeCharMessages(a: ComposeCharArgs): ApiMessage[] {
     a.adult,
     a.lore,
     systemPrompt(a.dto, a.opts, a.lore),
-    a.promptVariant,
   );
   const msgs = buildMessages(
     systemContent,
@@ -618,8 +608,6 @@ export function composeCharMessages(a: ComposeCharArgs): ApiMessage[] {
  *  undefined keeps the output byte-identical to the legacy shape. */
 export interface ComposeWorldArgs {
   adult: boolean;
-  /** Provider-specific prompt tuning. Omitted/default preserves Squid bytes. */
-  promptVariant?: ChatPromptVariant;
   dto: WorldContext;
   lore?: LoreInjection;
   historyBudgetTokens: number;
@@ -632,7 +620,6 @@ export function composeWorldMessages(a: ComposeWorldArgs): ApiMessage[] {
     a.adult,
     a.lore,
     worldSystemPrompt(a.dto, a.adult, a.lore),
-    a.promptVariant,
   );
   return buildMessages(
     systemContent,
