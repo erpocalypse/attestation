@@ -30,11 +30,11 @@ const EXPECTED_PCR0 =
 // Non-empty only during a measured image rollover. Both values are compiled
 // into the public client; remove the old pin as soon as the old fleet drains.
 const PREVIOUS_PCR0 =
-  "572ebfcb3ce3cc815bde10cc72498a3c473c117168f4b7595c28831e464165a7bb3a2eb97a312969b413bbdfafb481e2";
+  "";
 const PREVIOUS_PCR1 =
-  "3b4a7e1b5f13c5a1000b3ed32ef8995ee13e9876329f9bc72650b918329ef9cf4e2e4d1e1e37375dab0ba56ba0974d03";
+  "";
 const PREVIOUS_PCR2 =
-  "efb876639951dc13a6a04a0b6f4121e0335307c3ccf0bf1b6ea3c6f93599afb545ad9c98636d448c918f5117cd7192f5";
+  "";
 const EXPECTED_PCR1 =
   "3b4a7e1b5f13c5a1000b3ed32ef8995ee13e9876329f9bc72650b918329ef9cf4e2e4d1e1e37375dab0ba56ba0974d03";
 const EXPECTED_PCR2 =
