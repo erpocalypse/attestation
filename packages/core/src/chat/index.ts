@@ -10,4 +10,8 @@ export * from "./scoring";
 export * from "./summarize";
 export * from "./identity";
 export { WORLD_CORE, WORLD_LORE } from "./canon";
-export { HOUSE_PREAMBLE, SFW_PREAMBLE } from "./house-preamble";
+export {
+  HOUSE_PREAMBLE,
+  MIMO_HOUSE_PREAMBLE,
+  SFW_PREAMBLE,
+} from "./house-preamble";

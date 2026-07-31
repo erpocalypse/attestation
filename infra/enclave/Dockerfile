@@ -4,8 +4,7 @@
 # Determinism is achieved by freezing every input and erasing wall-clock time:
 #   • base image pinned by DIGEST (not the moving :2023 tag)
 #   • dnf frozen to an AL2023 dated repo SNAPSHOT (releasever) + exact pkg version
-#   • pip locked by exact version (transitive too); hash-locking (--require-hashes)
-#     is a TODO, not yet enforced — so installs are not yet hash-verified
+#   • pip locked by exact version + target-wheel SHA-256 hashes
 #   • kmstool/libnsm copied from a digest-pinned prebuilt stage (see build.sh)
 #   • all mtimes clamped to SOURCE_DATE_EPOCH and volatile state pruned at the end
 # Change any input → PCR0 changes (that's the feature). build.sh enforces the
@@ -40,13 +39,14 @@ COPY --from=kmstool /kmstool_enclave_cli /usr/bin/kmstool_enclave_cli
 COPY --from=kmstool /usr/lib64/libnsm.so /usr/lib64/libnsm.so
 RUN chmod 0755 /usr/bin/kmstool_enclave_cli
 
-# Python deps: EXACT-version pinned (incl. transitive) → byte-identical installs
-# from PyPI's immutable wheels. Hardening step is `--require-hashes` once the
-# build host has generated the hash lock (see requirements.txt / `build.sh lock`).
-COPY app/requirements.txt /app/requirements.txt
-RUN pip3 install --no-cache-dir -r /app/requirements.txt
+# Python deps: exact versions plus hashes of the AL2023/aarch64 target wheels.
+# `--only-binary` prevents an sdist build from introducing compiler/toolchain
+# drift into PCR0.
+COPY app/requirements.lock /app/requirements.lock
+RUN pip3 install --no-cache-dir --only-binary=:all: --require-hashes \
+      -r /app/requirements.lock
 
-COPY app/server.py app/memory_cadence.py app/provider_routing.py /app/
+COPY app/server.py app/memory_cadence.py app/provider_routing.py app/reply_integrity.py app/image_generation_contract.py /app/
 
 # The chat prompt-assembler: a Bun-compiled single-file binary running the SAME
 # @erpocalypse/core/chat TypeScript the API runs, so the prompts it builds inside
@@ -70,15 +70,13 @@ RUN rm -rf /var/cache/* /var/log/* /var/lib/dnf /var/lib/rpm /tmp/* /root/.cache
         -exec touch --no-dereference --date="@${SOURCE_DATE_EPOCH}" {} + 2>/dev/null || true
 
 # Inference egress target. server.py requires PROVIDER_HOST at startup; it's
-# reached ONLY through host vsock-proxy tunnels whose allowlist is crof, MiMo,
+# reached ONLY through host vsock-proxy tunnels whose allowlist is CROF,
 # DeepInfra, and KMS (see user-data.sh.tftpl). Provider hosts, paths, and model
 # ids are baked here so the exact egress contract is part of the measured,
 # reproducible image users attest.
 ENV PROVIDER_HOST=crof.ai \
     PROVIDER_PATH=/v1/chat/completions \
-    MIMO_HOST=api.xiaomimimo.com \
-    MIMO_PATH=/v1/chat/completions \
-    MIMO_MODEL=mimo-v2.5 \
+    MIMO_MODEL=mimo-v2.5-pro \
     KMS_REGION=us-west-2
 
 # CSAM moderation egress (BAC-135): the in-enclave child-safety screen calls

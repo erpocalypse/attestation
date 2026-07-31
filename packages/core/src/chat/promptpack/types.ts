@@ -16,6 +16,9 @@ export interface PromptPack {
   /** Adult house preamble: permission to write consensual adult fiction + the
    *  anti-slop prose bar. Prepended to every adult chat's system prompt. */
   housePreamble: string;
+  /** MiMo-only adult preamble. It includes the shared house preamble after an
+   *  identity-free fictional-writing commitment tuned for Octopus. */
+  mimoHousePreamble: string;
   /** SFW counterpart, used until a user has attested 18+. */
   sfwPreamble: string;
   /** The always-on, bounded world frame for 1:1 character chats (WORLD_CORE). */

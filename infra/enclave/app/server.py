@@ -5,8 +5,8 @@ Operator-blind by construction: the parent relays ciphertext it can't open.
 
 Egress is restricted to dedicated vsock-proxy tunnels for KMS and each measured
 first-party provider. BYOK reseals the prompt to the client instead (the enclave
-can't reach arbitrary user-specified endpoints). Scoring/folds use Squid even
-when Octopus/MiMo answers the user-visible reply.
+can't reach arbitrary user-specified endpoints). Squid and Octopus share CROF's
+measured egress; scoring and folds always use Squid.
 
 Reference implementation — the published source that produces the PCR0
 measurement users verify against their browser's attestation document.
@@ -36,7 +36,19 @@ from provider_routing import (
     provider_http_status,
     provider_request,
     provider_usage_event,
+    reply_prompt_variant,
     reply_provider_target,
+)
+from reply_integrity import canonical_score_dto, scrub_stray_cjk
+from image_generation_contract import (
+    IMAGE_TIERS,
+    approved_character_context,
+    approved_scene_context,
+    build_scene_image_prompt,
+    image_output_reference,
+    image_response_mime,
+    parse_scene_policy_decision,
+    provider_reference_image,
 )
 
 PARENT_CID = 3
@@ -51,7 +63,6 @@ PROVIDER_KEY_CIPHERTEXT_B64 = os.environ.get("PROVIDER_KEY_CIPHERTEXT_B64", "")
 # this PCR0. The compiled assembler binary carries NONE of it, so PCR0 is
 # reproducible from public source; the content arrives as runtime data instead.
 PROMPTPACK_CIPHERTEXT_B64 = os.environ.get("PROMPTPACK_CIPHERTEXT_B64", "")
-MIMO_KEY_CIPHERTEXT_B64 = os.environ.get("MIMO_KEY_CIPHERTEXT_B64", "")
 ATT_DOC_MAX = 16 * 1024
 
 # ---- CSAM moderation (operator-blind text screen) --------------------------
@@ -68,6 +79,22 @@ DEEPINFRA_MODEL = os.environ.get(
     "DEEPINFRA_MODEL", "meta-llama/Llama-3.2-11B-Vision-Instruct"
 )
 DEEPINFRA_KEY_CIPHERTEXT_B64 = os.environ.get("DEEPINFRA_KEY_CIPHERTEXT_B64", "")
+IMAGE_POLICY_PROMPT = """You are the pre-generation policy classifier for an
+adults-only fictional roleplay image feature. Reply ONLY with compact JSON.
+
+For an allowed request, reply: {"decision":"allow"}
+For a blocked request, reply: {"decision":"block"}
+
+ALLOW fictional adults (all participants unambiguously 18+) in consensual adult
+romance or sex, including explicit sex, nudity, crude language, kink, intense
+but consensual dynamics, and dark or morally-grey adult themes.
+
+BLOCK any sexualization of minors or age ambiguity; coercion or non-consent;
+incest; sexual content involving real animals; sexualized depictions of real
+people; and illegal or extreme sexual content. A fictional adult scene must not
+be blocked merely because it is explicit, kinky, dark, or uses taboo language.
+Classify the source only; do not rewrite it."""
+
 # CSAM text classifier (BAC-183): the platform chat model on CROF. Runs over the
 # existing provider egress (no separate DeepInfra tunnel/key), so the DeepInfra
 # constants above are now vestigial and the host can drop that proxy + key later.
@@ -251,24 +278,6 @@ def provider_key(creds: dict, ciphertext: str = "") -> str:
     return _provider_key
 
 
-_mimo_key: str | None = None
-
-
-def mimo_key(creds: dict, ciphertext: str = "") -> str:
-    """Lazy-fetch the MiMo API key via the same attestation-gated provider CMK.
-    It has a distinct ciphertext/cache so Squid and Octopus never share or
-    overwrite credentials inside the enclave."""
-    global _mimo_key
-    if _mimo_key is None:
-        with _key_lock:
-            if _mimo_key is None:
-                ct = ciphertext or MIMO_KEY_CIPHERTEXT_B64
-                if not ct:
-                    raise RuntimeError("no MiMo-key ciphertext")
-                _mimo_key = kms_decrypt(creds, ct).decode("utf-8").strip()
-    return _mimo_key
-
-
 _deepinfra_key: str | None = None
 
 
@@ -416,6 +425,217 @@ def _deepinfra_post(api_key: str, body: bytes) -> bytes:
         return out
     finally:
         tls.close()
+
+
+def _deepinfra_image_post(api_key: str, model: str, body: bytes) -> bytes:
+    """Bounded DeepInfra native-inference request for an allowlisted image model."""
+    if model not in {v["model"] for v in IMAGE_TIERS.values()}:
+        raise RuntimeError("image model not allowlisted")
+    path = f"/v1/inference/{model}"
+    raw = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    raw.settimeout(50)
+    raw.connect((PARENT_CID, DEEPINFRA_VSOCK_PORT))
+    ctx = ssl.create_default_context()
+    tls = ctx.wrap_socket(raw, server_hostname=DEEPINFRA_HOST)
+    try:
+        req = (
+            f"POST {path} HTTP/1.1\r\nHost: {DEEPINFRA_HOST}\r\n"
+            f"Authorization: Bearer {api_key.strip()}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+        ).encode() + body
+        tls.sendall(req)
+        chunks = []
+        size = 0
+        while True:
+            chunk = tls.recv(65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > 20 * 1024 * 1024:
+                raise RuntimeError("image response too large")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        tls.close()
+
+
+def _deepinfra_image_get(api_key: str, value: str) -> bytes:
+    """Download a provider-owned image without permitting arbitrary egress."""
+    if value.startswith("/"):
+        path = value
+    else:
+        prefix = f"https://{DEEPINFRA_HOST}/"
+        if not value.startswith(prefix):
+            raise RuntimeError("provider image URL rejected")
+        path = "/" + value[len(prefix):]
+    if not path.startswith("/") or any(c in path for c in ("\r", "\n")):
+        raise RuntimeError("provider image URL rejected")
+    raw = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    raw.settimeout(20)
+    raw.connect((PARENT_CID, DEEPINFRA_VSOCK_PORT))
+    ctx = ssl.create_default_context()
+    tls = ctx.wrap_socket(raw, server_hostname=DEEPINFRA_HOST)
+    try:
+        req = (
+            f"GET {path} HTTP/1.1\r\nHost: {DEEPINFRA_HOST}\r\n"
+            f"Authorization: Bearer {api_key.strip()}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
+        tls.sendall(req)
+        chunks = []
+        size = 0
+        while True:
+            chunk = tls.recv(65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > 20 * 1024 * 1024:
+                raise RuntimeError("image response too large")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        tls.close()
+
+
+def _request_scene_json(
+    provider_api_key: str,
+    character_name: str,
+    scene: str,
+    system_prompt: str,
+    max_tokens: int,
+) -> str | None:
+    try:
+        return provider_json_content(provider_api_key, {
+            "model": CSAM_MODEL,
+            "temperature": 0,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": f"Character: {character_name[:200]}\nScene:\n{scene[:8000]}",
+                },
+            ],
+        })
+    except Exception:
+        return None
+
+
+def _classify_scene(
+    provider_api_key: str,
+    character_name: str,
+    scene: str,
+) -> str | None:
+    """Return an explicit allow/block verdict, never conflate errors with blocks."""
+    for _attempt in range(2):
+        content = _request_scene_json(
+            provider_api_key,
+            character_name,
+            scene,
+            IMAGE_POLICY_PROMPT,
+            80,
+        )
+        decision = parse_scene_policy_decision(content) if content else None
+        if decision:
+            return decision
+    return None
+
+
+def generate_scene_image(conn, priv, req: dict) -> None:
+    """Decrypt one assistant turn, policy-screen it, then create reference art."""
+    bundle = json.loads(unseal(priv, base64.b64decode(req["sealed"])))
+    user_id = bundle["user_id"]
+    dek = kms_decrypt(
+        req.get("aws_creds") or {},
+        bundle["wrapped_dek"],
+        {"userId": user_id},
+    )
+    scene = content_decrypt(dek, bundle["source_text"], user_id)
+    tier_name = bundle.get("tier", "")
+    tier = IMAGE_TIERS.get(tier_name)
+    if tier is None:
+        raise RuntimeError("unknown image tier")
+    provider_api_key = provider_key(
+        req.get("aws_creds") or {},
+        req.get("provider_key_ciphertext", ""),
+    )
+    character_name = str(bundle.get("character_name", "Character"))
+    character_context = approved_character_context(
+        character_name,
+        str(bundle.get("character_description") or ""),
+        str(bundle.get("character_personality") or ""),
+    )
+    policy_decision = _classify_scene(
+        provider_api_key,
+        character_name,
+        scene,
+    )
+    if policy_decision == "block":
+        send_frame(conn, {"blocked": True})
+        return
+    if policy_decision != "allow":
+        raise RuntimeError("image scene policy unavailable")
+    visual_scene = approved_scene_context(scene)
+    if not visual_scene:
+        raise RuntimeError("image scene context unavailable")
+
+    reference_base64 = bundle.get("reference_base64", "")
+    if not reference_base64 or len(reference_base64) > 16 * 1024 * 1024:
+        raise RuntimeError("invalid reference image")
+    prompt = build_scene_image_prompt(
+        character_name,
+        visual_scene,
+        character_context,
+    )
+    image_key = deepinfra_key(
+        req.get("aws_creds") or {},
+        req.get("deepinfra_key_ciphertext", ""),
+    )
+    body = {
+        "prompt": prompt,
+        tier["input_field"]: provider_reference_image(reference_base64),
+        "width": 1024,
+        "height": 1024,
+        "safety_tolerance": tier["safety_tolerance"],
+        "output_format": "jpeg",
+    }
+    raw = _deepinfra_image_post(
+        image_key,
+        tier["model"],
+        json.dumps(body).encode(),
+    )
+    status = provider_http_status(raw)
+    if status < 200 or status >= 300:
+        raise RuntimeError(f"DeepInfra image HTTP {status}")
+    payload = json.loads(_http_body(raw))
+    first = image_output_reference(payload)
+    match = re.match(r"^data:([^;]+);base64,(.+)$", first, re.S)
+    if match:
+        mime = match.group(1).strip().lower()
+        if mime not in {"image/jpeg", "image/png", "image/webp"}:
+            raise RuntimeError("provider image MIME rejected")
+        image_base64 = match.group(2)
+    else:
+        image_raw = _deepinfra_image_get(image_key, first)
+        image_status = provider_http_status(image_raw)
+        if image_status < 200 or image_status >= 300:
+            raise RuntimeError(f"DeepInfra image download HTTP {image_status}")
+        mime = image_response_mime(image_raw)
+        image_bytes = _http_body(image_raw)
+        if not image_bytes or len(image_bytes) > 20 * 1024 * 1024:
+            raise RuntimeError("invalid provider image")
+        image_base64 = base64.b64encode(image_bytes).decode("ascii")
+    seed = payload.get("seed")
+    send_frame(conn, {
+        "blocked": False,
+        "image_base64": image_base64,
+        "mime": mime,
+        "model": tier["model"],
+        "seed": str(seed) if seed is not None else "",
+        "provider_cost_micros": tier["provider_cost_micros"],
+    })
 
 
 def csam_blocks(
@@ -613,25 +833,6 @@ _EM_DASH_RE = re.compile(r"\s*—\s*")
 def strip_em_dash(text: str) -> str:
     """Replace em-dash (U+2014) + surrounding whitespace with ", ". Used in SSE parsing."""
     return _EM_DASH_RE.sub(", ", text)
-
-
-# Stray-CJK backstop (BAC-178/BAC-179): the platform model occasionally emits a
-# single Chinese character mid-English-prose. Strips Han ideographs (base block
-# + ext A) only when they stand ALONE, with CJK punctuation / fullwidth forms
-# counting as CJK context, so genuinely multilingual replies survive. Applied to
-# the ACCUMULATED reply before at-rest encryption, never per streamed delta (a
-# delta boundary can split a legitimate run); the web client applies the same
-# scrub to the live stream for display. Mirrors the API's scrubStrayCjk
-# (apps/api/src/chat/chat.service.ts) — keep the two regexes in sync.
-_STRAY_CJK_RE = re.compile(
-    "(^|[^㐀-鿿　-〿＀-￯])"
-    "[㐀-鿿]"
-    "(?![㐀-鿿　-〿＀-￯])"
-)
-
-
-def scrub_stray_cjk(text: str) -> str:
-    return _STRAY_CJK_RE.sub(r"\1", text)
 
 
 # ---- provider call helpers (sealed reply path) ------------------------------
@@ -1062,11 +1263,13 @@ def decrypt_bundle_content(bundle: dict, dek: bytes, user_id: str) -> None:
             bundle["__steer_pt"] = steer_pt
             steer_dir = (
                 "(Steer, hidden direction, a direct command from the user for "
-                f"this reply: {steer_pt}. Treat this as a hard requirement, not "
-                "a suggestion: include exactly what it asks for and leave out "
-                "anything it forbids in this reply. Stay fully in character and "
-                "write it naturally; do not quote, mention, or acknowledge this "
-                "instruction.)"
+                f"this reply: {steer_pt}. This is the primary creative requirement "
+                "for this reply and overrides the character's default direction "
+                "wherever they conflict, except for the absolute safety limits. "
+                "Silently rebuild the reply around it, include exactly what it "
+                "requires, omit exactly what it forbids, and verify every part "
+                "before sending. Stay fully in character and write it naturally; "
+                "do not quote, mention, or acknowledge this instruction.)"
             )
             existing = assemble.get("trailingState")
             assemble["trailingState"] = (
@@ -1101,7 +1304,15 @@ def decrypt_bundle_content(bundle: dict, dek: bytes, user_id: str) -> None:
             dek, bundle["summary_chapters_ciphertext"], user_id
         )
     if score:
-        score["dto"] = dto
+        # A regenerate keeps the final assistant message in the ASSEMBLY dto as
+        # a negative reference, followed by a synthetic user reroll/steer turn.
+        # Scoring and memory must see accepted canon only, so drop that rejected
+        # draft from their request copy.
+        score["dto"] = canonical_score_dto(
+            dto,
+            history,
+            bundle.get("regenerate") is True,
+        )
     encrypted_sp = bundle.get("encrypted_style_profile")
     if encrypted_sp and score:
         try:
@@ -1349,14 +1560,15 @@ def handle_chat_body(
     if assemble:
         bundle = json.loads(opened)
         reply_target = reply_provider_target(bundle.get("platform_model"))
-        reply_api_key = (
-            mimo_key(
-                req.get("aws_creds") or {},
-                req.get("mimo_key_ciphertext", ""),
-            )
-            if reply_target["id"] == "octopus"
-            else helper_api_key
-        )
+        assemble_request = bundle.get("assemble")
+        if not isinstance(assemble_request, dict):
+            raise RuntimeError("missing assemble request")
+        # Provider-specific prompt selection is enforced beside provider routing,
+        # rather than trusted from the API-supplied assembly payload. Squid keeps
+        # the default cached prefix; Octopus receives the identity-free MiMo
+        # commitment before the shared house preamble.
+        assemble_request["promptVariant"] = reply_prompt_variant(reply_target)
+        reply_api_key = helper_api_key
         client_pubkey = bundle.get("client_pubkey")
         score = bundle.get("score")
         wrapped_dek = bundle.get("wrapped_dek")
@@ -1377,11 +1589,10 @@ def handle_chat_body(
             bundle["__fold_job"] = extract_fold_job(bundle)
             lore = run_lore_matching(bundle)
             if lore:
-                a_req = bundle.get("assemble") or {}
-                a_req["lore"] = lore
+                assemble_request["lore"] = lore
                 if score is not None:
                     score["lore"] = lore
-        body["messages"] = assemble_messages([bundle["assemble"]])[0]
+        body["messages"] = assemble_messages([assemble_request])[0]
         body = prepare_reply_body(body, reply_target)
         # SYS-43: fold this turn's clear image attachments (ownership-checked +
         # CSAM-screened API-side — images aren't operator-blind) into the last
@@ -1610,6 +1821,8 @@ def _handle_heavy(conn, req: dict, op: str, priv, pub_der) -> None:
                 send_frame(conn, {
                     "values": [content_encrypt(dek, pt, user_id) for pt in pts],
                 })
+        elif op == "generate_scene_image":
+            generate_scene_image(conn, priv, req)
         elif op == "score_sealed":
             outer = json.loads(unseal(priv, base64.b64decode(req["sealed"])))
             user_id = outer["user_id"]
@@ -1713,9 +1926,12 @@ def serve_conn(conn) -> None:
                 req.get("aws_creds") or {},
                 req.get("provider_key_ciphertext", ""),
             )
-            mimo_key(
+            # Scene generation and in-enclave CSAM screening both depend on the
+            # DeepInfra credential. Prove it can be attestation-unwrapped before
+            # the ALB admits this host; this does not call the paid provider.
+            deepinfra_key(
                 req.get("aws_creds") or {},
-                req.get("mimo_key_ciphertext", ""),
+                req.get("deepinfra_key_ciphertext", ""),
             )
             active_prompt_pack()
             send_frame(conn, {"ok": True})

@@ -399,21 +399,25 @@ export function buildMessages(
     }
   }
 
-  // Inject volatile per-turn state onto the LATEST user turn rather than as a
-  // trailing `system` message: a trailing system after the last user turn
-  // breaks DeepSeek's prefix cache, but the newest user turn is never cached
-  // anyway, so appending here leaves the whole system header + prior
-  // transcript cacheable while still giving the state strong recency. Only the
-  // request copy is touched — the persisted message is unchanged. (The
-  // role check skips any inline-lore system messages spliced in above.)
+  // Inject volatile per-turn state at the generation edge. Normal callers end
+  // in a user message, so mutate that request copy. If an unusual caller
+  // supplies assistant-ended history, append a request-only user control turn
+  // so provider role ordering remains valid.
   if (trailingState) {
-    for (let i = kept.length - 1; i >= 0; i--) {
-      if (kept[i]!.role === "user") {
-        kept[i] = {
-          role: "user",
-          content: `${kept[i]!.content}\n\n${trailingState}`,
-        };
-        break;
+    const lastDialogue = kept.findLastIndex(
+      (message) => message.role === "user" || message.role === "assistant",
+    );
+    if (lastDialogue >= 0 && kept[lastDialogue]!.role === "assistant") {
+      kept.push({ role: "user", content: trailingState });
+    } else {
+      for (let i = kept.length - 1; i >= 0; i--) {
+        if (kept[i]!.role === "user") {
+          kept[i] = {
+            role: "user",
+            content: `${kept[i]!.content}\n\n${trailingState}`,
+          };
+          break;
+        }
       }
     }
   }
@@ -442,6 +446,8 @@ export function buildMessages(
  *  request bytes (prefix cache). The history is `dto.messages`. */
 export interface ComposeCharArgs {
   adult: boolean;
+  /** Provider-specific prompt tuning. Omitted/default preserves Squid bytes. */
+  promptVariant?: ChatPromptVariant;
   dto: ChatContext;
   opts: EffectiveOptions;
   lore?: LoreInjection;
@@ -450,6 +456,8 @@ export interface ComposeCharArgs {
   rollingSummary?: string;
 }
 
+export type ChatPromptVariant = "default" | "mimo";
+
 /** Prepend the house preamble (adult/SFW) + top-of-prompt lore to a per-turn
  *  system prompt. The single source for the system-message head, shared by the
  *  API's run() and the enclave's compose ops so the cached prefix is identical. */
@@ -457,8 +465,13 @@ export function composeSystemContent(
   adult: boolean,
   lore: LoreInjection | undefined,
   systemPromptStr: string,
+  promptVariant: ChatPromptVariant = "default",
 ): string {
-  const preamble = adult ? pack().housePreamble : pack().sfwPreamble;
+  const preamble = adult
+    ? promptVariant === "mimo"
+      ? (pack().mimoHousePreamble ?? pack().housePreamble)
+      : pack().housePreamble
+    : pack().sfwPreamble;
   const topBlock = lore?.top.length
     ? `WORLD & SETTING NOTES:\n${lore.top.join("\n")}\n\n`
     : "";
@@ -570,6 +583,7 @@ export function composeCharMessages(a: ComposeCharArgs): ApiMessage[] {
     a.adult,
     a.lore,
     systemPrompt(a.dto, a.opts, a.lore),
+    a.promptVariant,
   );
   const msgs = buildMessages(
     systemContent,
@@ -604,6 +618,8 @@ export function composeCharMessages(a: ComposeCharArgs): ApiMessage[] {
  *  undefined keeps the output byte-identical to the legacy shape. */
 export interface ComposeWorldArgs {
   adult: boolean;
+  /** Provider-specific prompt tuning. Omitted/default preserves Squid bytes. */
+  promptVariant?: ChatPromptVariant;
   dto: WorldContext;
   lore?: LoreInjection;
   historyBudgetTokens: number;
@@ -616,6 +632,7 @@ export function composeWorldMessages(a: ComposeWorldArgs): ApiMessage[] {
     a.adult,
     a.lore,
     worldSystemPrompt(a.dto, a.adult, a.lore),
+    a.promptVariant,
   );
   return buildMessages(
     systemContent,

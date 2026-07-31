@@ -26,16 +26,19 @@ const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
 // bump these WITH measurements.json and re-publish the attestation mirror BEFORE
 // flipping the fleet, or every client's check fails.
 const EXPECTED_PCR0 =
-  "4743a7088a39061cda5f66ba53254bd60aa137c54f1b10835bed04fb6e1302d9ec5ed6a1ad148a6a9d74fd383556ee56";
+  "572ebfcb3ce3cc815bde10cc72498a3c473c117168f4b7595c28831e464165a7bb3a2eb97a312969b413bbdfafb481e2";
 // Non-empty only during a measured image rollover. Both values are compiled
 // into the public client; remove the old pin as soon as the old fleet drains.
-const PREVIOUS_PCR0 = "";
-const PREVIOUS_PCR1 = "";
-const PREVIOUS_PCR2 = "";
+const PREVIOUS_PCR0 =
+  "7874036cb4b3efd4315eaad6eb3a312d4357d2e7bfe58bea6e40da072b2133ac0f3284423382c355670522f95f2f069f";
+const PREVIOUS_PCR1 =
+  "3b4a7e1b5f13c5a1000b3ed32ef8995ee13e9876329f9bc72650b918329ef9cf4e2e4d1e1e37375dab0ba56ba0974d03";
+const PREVIOUS_PCR2 =
+  "2b870104fcb9350bc6ed51d367dbfc53ebe1ac703c2fcc851daca925f4d55ddafde0d8c0cb420d603b588f28807b65d3";
 const EXPECTED_PCR1 =
   "3b4a7e1b5f13c5a1000b3ed32ef8995ee13e9876329f9bc72650b918329ef9cf4e2e4d1e1e37375dab0ba56ba0974d03";
 const EXPECTED_PCR2 =
-  "8fc16259307ac7c0ccdab53dba04ac9aca887d1a02e3a2b7d3b30bce50e9ebbdffccee5e88eebca710af40e817cfe6b3";
+  "efb876639951dc13a6a04a0b6f4121e0335307c3ccf0bf1b6ea3c6f93599afb545ad9c98636d448c918f5117cd7192f5";
 
 export interface Check {
   ok: boolean;

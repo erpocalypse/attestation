@@ -8,18 +8,15 @@ from __future__ import annotations
 import os
 
 PROVIDER_VSOCK_PORT = 8002
-MIMO_VSOCK_PORT = 8004
 
 PROVIDER_HOST = os.environ.get("PROVIDER_HOST")
 if PROVIDER_HOST is None:
     raise RuntimeError("PROVIDER_HOST is required")
 PROVIDER_PATH = os.environ.get("PROVIDER_PATH", "/chat/completions")
-MIMO_HOST = os.environ.get("MIMO_HOST", "api.xiaomimimo.com")
-MIMO_PATH = os.environ.get("MIMO_PATH", "/v1/chat/completions")
-MIMO_MODEL = os.environ.get("MIMO_MODEL", "mimo-v2.5")
+MIMO_MODEL = os.environ.get("MIMO_MODEL", "mimo-v2.5-pro")
 
 CROF_FLASH_PRICES = {"in_miss": 0.12, "in_cached": 0.003, "out": 0.21}
-MIMO_V25_PRICES = {"in_miss": 0.14, "in_cached": 0.0028, "out": 0.28}
+CROF_MIMO_PRO_PRICES = {"in_miss": 0.40, "in_cached": 0.003, "out": 0.80}
 
 
 def reply_provider_target(platform_model: str | None) -> dict:
@@ -30,13 +27,14 @@ def reply_provider_target(platform_model: str | None) -> dict:
     if platform_model == "octopus":
         return {
             "id": "octopus",
-            "host": MIMO_HOST,
-            "path": MIMO_PATH,
-            "port": MIMO_VSOCK_PORT,
-            "auth": "api-key",
-            "provider": "mimo",
+            "host": PROVIDER_HOST,
+            "path": PROVIDER_PATH,
+            "port": PROVIDER_VSOCK_PORT,
+            "auth": "bearer",
+            "provider": "crof",
             "model": MIMO_MODEL,
-            "prices": MIMO_V25_PRICES,
+            "prices": CROF_MIMO_PRO_PRICES,
+            "supports_vision": False,
         }
     return {
         "id": "squid",
@@ -47,18 +45,23 @@ def reply_provider_target(platform_model: str | None) -> dict:
         "provider": "crof",
         "model": "deepseek-v4-flash",
         "prices": CROF_FLASH_PRICES,
+        "supports_vision": False,
     }
+
+
+def reply_prompt_variant(target: dict) -> str:
+    """Choose the prompt preamble beside the measured reply-provider route."""
+    return "mimo" if target.get("id") == "octopus" else "default"
 
 
 def prepare_reply_body(body: dict, target: dict) -> dict:
     """Enforce provider-specific model and reasoning knobs in-enclave."""
     out = dict(body)
     out["model"] = target["model"]
-    if target["id"] == "octopus":
-        out.pop("reasoning_effort", None)
-        out["thinking"] = {"type": "disabled"}
-        out.pop("enable_thinking", None)
-        out.pop("chat_template_kwargs", None)
+    out["reasoning_effort"] = "none"
+    out.pop("thinking", None)
+    out.pop("enable_thinking", None)
+    out.pop("chat_template_kwargs", None)
     return out
 
 
@@ -70,12 +73,12 @@ def attach_image_parts(messages: list, images: list | None, target: dict) -> lis
     the API only on turns that carry an upload. Images are deliberately NOT
     operator-blind: the API ownership-checks and CSAM-screens them before the
     bundle is built, so they arrive here in the clear. Only the vision
-    provider (Octopus/MiMo) accepts content-parts arrays, so any other target
-    returns the messages untouched; likewise a turn with no images returns
+    provider accepts content-parts arrays, so a text-only target returns the
+    messages untouched; likewise a turn with no images returns
     byte-identical messages, keeping text-only prompts (and the DeepSeek
     prefix cache) unaffected. Malformed entries are skipped, never fatal.
     """
-    if not images or target.get("id") != "octopus":
+    if not images or not target.get("supports_vision"):
         return messages
     for msg in reversed(messages):
         if not isinstance(msg, dict) or msg.get("role") != "user":

@@ -14,6 +14,7 @@
  *  exactly as before. */
 import { clampDifficulty } from "./difficulty";
 import { difficultyGuidance, loreFacts, stripEmDash } from "./assembly";
+import { extractIdentity } from "./identity";
 import { pack, fill } from "./promptpack/active";
 import { GIFT_MARKER, type ChatContext, type LoreInjection } from "./types";
 
@@ -76,6 +77,16 @@ export function buildScoringMessages(input: ScoringInput): {
   const persona = dto.persona;
   const styleProfile = input.styleProfile;
   const lore = input.lore;
+  const statedNames = [
+    ...(persona?.name?.trim() ? [persona.name.trim()] : []),
+    ...dto.messages
+      .filter((m) => m.role === "user")
+      .map((m) => extractIdentity(m.text)?.name)
+      .filter((candidate): candidate is string => Boolean(candidate)),
+  ].filter((candidate, index, all) => all.indexOf(candidate) === index);
+  const userNameEvidence = statedNames.length
+    ? `USER NAME EVIDENCE: The only supported user name${statedNames.length === 1 ? " is" : "s are"} ${statedNames.map((candidate) => JSON.stringify(candidate)).join(", ")}. A persona name or an explicit user-authored "my name is ..." / "call me ..." statement is evidence. No character reply is evidence.`
+    : 'USER NAME EVIDENCE: None. The user has not explicitly supplied a name in the available persona or user-authored conversation. The memory must not name the user or claim they already disclosed a name.';
 
   const transcript = dto.messages
     .slice(-feat.scoreWindow)
@@ -122,6 +133,7 @@ export function buildScoringMessages(input: ScoringInput): {
     "Recent conversation:",
     transcript,
     `${name} (just now): ${scoredReply}`,
+    memoryEnabled ? userNameEvidence : "",
     memoryEnabled
       ? `\nPrior memory (${name}'s recollection of this user and what's happened between them) ${pack().scoringPriorMemoryFence}:\n${priorMemory || "(nothing yet)"}`
       : "",

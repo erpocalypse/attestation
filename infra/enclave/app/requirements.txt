@@ -4,10 +4,8 @@
 # with PYTHONDONTWRITEBYTECODE + the mtime clamp in the Dockerfile, the python
 # layer is deterministic.
 #
-# HARDENING (next step): full hash-lock for tamper-evidence against a same-version
-# PyPI swap. Generate on the aarch64 build host and switch the Dockerfile to
-# `pip install --require-hashes`:
-#   ./build.sh lock      # -> writes hashes here via `pip download` + `pip hash`
+# `requirements.lock` carries the SHA-256 hashes used by the Docker build.
+# Regenerate it on the aarch64 build host with `./build.sh lock`.
 #
 # Target wheels: cp3x-abi3-manylinux_2_28_aarch64 (AL2023 / Graviton).
 cryptography==43.0.1

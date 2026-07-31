@@ -197,12 +197,17 @@ assembler)
 	;;
 lock)
 	# Generate a hash lock for the pinned deps (run on the aarch64 build host).
-	# Downloads the exact wheels and appends their sha256 as pip --hash lines,
-	# so the Dockerfile can switch to `pip install --require-hashes`.
+	# Binary-only is deliberate: an sdist would make PCR0 depend on an unpinned
+	# compiler toolchain. On AL2023/aarch64 pip selects exactly these wheels.
 	rm -rf /tmp/wheels && mkdir -p /tmp/wheels
-	pip3 download --no-deps -d /tmp/wheels -r app/requirements.txt
+	pip3 download --no-deps --only-binary=:all: -d /tmp/wheels \
+		-r app/requirements.txt
 	{ grep -vE '^\s*#|^\s*$' app/requirements.txt | while read -r pkg; do
 		f="$(ls /tmp/wheels | grep -iE "^${pkg%%==*}-" | head -1)"
+		[ -n "$f" ] || {
+			echo "No binary wheel downloaded for $pkg" >&2
+			exit 1
+		}
 		printf '%s \\\n    --hash=sha256:%s\n' "$pkg" \
 			"$(sha256sum "/tmp/wheels/$f" | awk '{print $1}')"
 	done; } >app/requirements.lock
